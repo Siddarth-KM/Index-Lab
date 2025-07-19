@@ -1,0 +1,38 @@
+Business Requirements:
+----------------------
+1. Provide an AI-driven platform for predicting stock and index movements with confidence intervals.
+2. Enable users to analyze both major indexes (SPY, DOW, NASDAQ, SP400, SPLV, SPHB) and custom tickers.
+3. Support decision-making for investors and analysts by providing clear, actionable predictions and market analysis.
+4. Ensure the platform is user-friendly, visually appealing, and accessible via a web interface.
+
+Technical Requirements:
+----------------------
+1. Backend implemented in Python using Flask, with yfinance for data, scikit-learn and related libraries for ML, and matplotlib for charting.
+2. Frontend implemented in React (JavaScript), styled with Tailwind CSS, and communicates with the backend via REST API.
+3. Support for parallel processing and caching to ensure fast predictions and scalability.
+4. Hardcoded ticker lists for SPLV and SPHB due to lack of reliable online sources.
+5. Docker compatibility for deployment (optional, future-proofing).
+6. Secure CORS configuration and input validation.
+
+Functional Requirements:
+------------------------
+1. Allow users to select an index or enter a custom ticker for prediction.
+2. Allow configuration of prediction window, confidence interval, and model selection (auto/manual).
+3. Display predictions for indexes and top stocks, including confidence intervals.
+4. Show which models were used for each prediction.
+5. Provide a market analysis box showing detected market regime and strength.
+6. Display historical and predicted price charts, with a clear visual transition between past and future.
+7. Handle errors gracefully and provide user-friendly error messages.
+8. Support both single ticker and multi-ticker (index) workflows.
+9. Cache index constituents and stock data for performance.
+10. Allow for easy addition of new indexes or custom ticker lists.
+
+Non-Functional Requirements:
+----------------------------
+1. The system must respond to prediction requests within 10 seconds for typical use cases.
+2. The UI must be responsive and accessible on both desktop and mobile devices.
+3. The backend must handle at least 10 concurrent prediction requests.
+4. All user data and API endpoints must be secured against common web vulnerabilities.
+5. The system must be maintainable, with clear code structure and documentation.
+6. The system must be extensible to support additional models, indexes, or data sources in the future.
+7. The system must provide accurate and reliable predictions, with clear communication of confidence and limitations. 
