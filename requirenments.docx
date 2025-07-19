@@ -20,12 +20,11 @@ Functional Requirements:
 2. Allow configuration of prediction window, confidence interval, and model selection (auto/manual).
 3. Display predictions for indexes and top stocks, including confidence intervals.
 4. Show which models were used for each prediction.
-5. Provide a market analysis box showing detected market regime and strength.
+5. Provide market analysis showing detected market regime and strength.
 6. Display historical and predicted price charts, with a clear visual transition between past and future.
 7. Handle errors gracefully and provide user-friendly error messages.
 8. Support both single ticker and multi-ticker (index) workflows.
 9. Cache index constituents and stock data for performance.
-10. Allow for easy addition of new indexes or custom ticker lists.
 
 Non-Functional Requirements:
 ----------------------------
