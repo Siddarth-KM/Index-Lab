@@ -112,7 +112,7 @@ Health check endpoint.
 7. **Support Vector Regression** - Balanced, stable
 8. **Gradient Boosting Conformal** - High volatility, adaptive
 9. **Elastic Net Conformal** - Low volatility, regularized
-10. **Transformer** - Deep learning, sequence modeling
+10. **MLPRegressor Sequence Model** - Sequence modeling using scikit-learn MLPRegressor (not a deep learning transformer)
 
 ## Market Conditions
 

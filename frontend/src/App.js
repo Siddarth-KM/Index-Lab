@@ -95,7 +95,7 @@ const StockPredictionApp = () => {
     { id: 7, name: 'Support Vector Regression', description: 'Balanced, stable' },
     { id: 8, name: 'Gradient Boosting Conformal', description: 'High vol, adaptive' },
     { id: 9, name: 'Elastic Net Conformal', description: 'Low vol, regularized' },
-    { id: 10, name: 'Transformer', description: 'Deep learning, sequence modeling' }
+    { id: 10, name: 'MLPRegressor Sequence Model', description: 'Sequence modeling (scikit-learn MLPRegressor)' }
   ];
   // --- Model explanations for tooltips ---
   const modelExplanations = {
@@ -136,8 +136,8 @@ const StockPredictionApp = () => {
       desc: 'Regularized regression with conformal intervals. Best for low volatility, regularized for stability.'
     },
     10: {
-      title: 'Transformer',
-      desc: 'Deep learning for sequences. Captures long-term dependencies, excels in complex, non-linear markets.'
+      title: 'MLPRegressor Sequence Model',
+      desc: 'Sequence modeling using scikit-learn MLPRegressor. Captures sequential patterns, but is not a deep learning transformer.'
     }
   };
 
