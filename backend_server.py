@@ -1173,22 +1173,28 @@ def predict():
                 })
             stock_predictions.sort(key=lambda x: x['pred'], reverse=True)
             stock_predictions = stock_predictions[:num_stocks]
-            # Use ETF for index-level prediction if available
-            if etf_df is not None:
-                index_pred_df = etf_df
-                index_name_for_chart = etf_ticker
+            
+            # Use the ETF's own prediction for the main index prediction
+            etf_prediction_result = trained_models.get(etf_ticker)
+            if etf_ticker and etf_prediction_result:
+                index_prediction = np.mean(list(etf_prediction_result.values()))
+                confidence_factor = confidence_interval / 100.0
+                interval_width = 0.05 * (1 - confidence_factor)
+                index_lower = index_prediction - interval_width
+                index_upper = index_prediction + interval_width
+                index_name_for_response = etf_ticker
             else:
-                index_pred_df = list(processed_data.values())[0]
-                index_name_for_chart = index
-            # Use the last available row for prediction chart
-            index_prediction = np.mean([s['pred'] for s in stock_predictions[:5]])
-            index_lower = np.mean([s['lower'] for s in stock_predictions[:5]])
-            index_upper = np.mean([s['upper'] for s in stock_predictions[:5]])
+                # Fallback to averaging top 5 stocks if ETF prediction is not available
+                index_prediction = np.mean([s['pred'] for s in stock_predictions[:5]]) if stock_predictions else 0
+                index_lower = np.mean([s['lower'] for s in stock_predictions[:5]]) if stock_predictions else 0
+                index_upper = np.mean([s['upper'] for s in stock_predictions[:5]]) if stock_predictions else 0
+                index_name_for_response = index
+
             chart_image = create_multi_stock_prediction_chart(stock_data, stock_predictions, prediction_window)
             response = {
                 'index_prediction': {
-                    'ticker': index,
-                    'index_name': index,
+                    'ticker': index_name_for_response,
+                    'index_name': index_name_for_response,
                     'pred': index_prediction,
                     'lower': index_lower,
                     'upper': index_upper
