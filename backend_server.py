@@ -808,7 +808,7 @@ def simulate_prediction_model(df, model_id, prediction_window, confidence_interv
     
     # Adjust based on model type
     if model_id in [1, 4, 8]:  # Aggressive models
-        base_prediction *= 1.5
+        base_prediction *= 1.3
     elif model_id in [6, 9]:   # Conservative models
         base_prediction *= 0.7
     
@@ -822,50 +822,9 @@ def simulate_prediction_model(df, model_id, prediction_window, confidence_interv
     # Calculate confidence interval
     confidence_factor = confidence_interval / 100.0
     interval_width = 0.05 * (1 - confidence_factor)  # Wider interval for lower confidence
-    
     lower = base_prediction - interval_width
     upper = base_prediction + interval_width
-    
     return base_prediction, lower, upper
-
-def calculate_rsi(prices, period=14):
-    """Calculate RSI indicator (fallback method)"""
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def generate_stock_predictions(index_ticker, num_stocks, start_date, prediction_window, confidence_interval):
-    """Generate predictions for multiple stocks in an index"""
-    # Get index components (simplified - in real app you'd get actual components)
-    if index_ticker == 'SPY':
-        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'NFLX', 'ADBE', 'CRM']
-    elif index_ticker == 'DOW':
-        tickers = ['AAPL', 'MSFT', 'JPM', 'JNJ', 'V', 'WMT', 'PG', 'UNH', 'HD', 'DIS']
-    elif index_ticker == 'NASDAQ':
-        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'NVDA', 'META', 'NFLX', 'ADBE', 'CRM']
-    else:
-        tickers = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-    
-    predictions = []
-    
-    for ticker in tickers[:num_stocks]:
-        df = download_index_data(ticker, start_date)
-        if df is not None and len(df) > 50:
-            pred, lower, upper = simulate_prediction_model(df, 2, prediction_window, confidence_interval)
-            if pred is not None:
-                predictions.append({
-                    'ticker': ticker,
-                    'pred': pred,
-                    'lower': lower,
-                    'upper': upper
-                })
-    
-    # Sort by prediction value
-    predictions.sort(key=lambda x: x['pred'], reverse=True)
-    return predictions
 
 def create_prediction_chart(df, prediction, lower, upper, ticker_name):
     """Create a matplotlib chart showing prediction"""
@@ -912,8 +871,6 @@ def create_prediction_chart(df, prediction, lower, upper, ticker_name):
 
 def create_multi_stock_prediction_chart(stock_data, stock_predictions, prediction_window):
     """Plot all top N stocks: last X days of history and X days of forecast, normalized to 100 at -X. Fix gap between history and prediction."""
-    import matplotlib.pyplot as plt
-    import numpy as np
     plt.figure(figsize=(14, 8))
     plt.style.use('dark_background')
     colors = cm.get_cmap('tab10', len(stock_predictions))
