@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
@@ -28,13 +29,70 @@ from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import xgboost as xgb
-import lightgbm as lgb
 # Removed TensorFlow and PyTorch imports - using scikit-learn alternatives
 import matplotlib.cm as cm
 from bs4.element import Tag
-
+from scipy import stats
 app = Flask(__name__)
 CORS(app)
+
+# --- Improved Confidence Interval Calculations ---
+def calculate_proper_confidence_interval(predictions, confidence_level=95, base_volatility=0.02):
+    """
+    Calculate proper confidence intervals based on model ensemble variance
+    and historical volatility.
+    """
+    if isinstance(predictions, dict):
+        pred_values = list(predictions.values())
+    else:
+        pred_values = predictions
+    mean_pred = np.mean(pred_values)
+    model_std = np.std(pred_values) if len(pred_values) > 1 else 0
+    total_uncertainty = np.sqrt(model_std**2 + base_volatility**2)
+    if len(pred_values) < 30:
+        alpha = (100 - confidence_level) / 100
+        t_value = stats.t.ppf(1 - alpha/2, df=len(pred_values)-1)
+        margin_of_error = t_value * total_uncertainty
+    else:
+        alpha = (100 - confidence_level) / 100
+        z_value = stats.norm.ppf(1 - alpha/2)
+        margin_of_error = z_value * total_uncertainty
+    lower_bound = mean_pred - margin_of_error
+    upper_bound = mean_pred + margin_of_error
+    return lower_bound, upper_bound
+
+def calculate_regime_adjusted_confidence(predictions, market_condition, market_strength, confidence_level=95):
+    regime_volatility = {
+        'bull': 0.015,
+        'bear': 0.025,
+        'sideways': 0.018,
+        'volatile': 0.035
+    }
+    base_vol = regime_volatility.get(market_condition, 0.02)
+    adjusted_vol = base_vol * (0.5 + market_strength)
+    return calculate_proper_confidence_interval(predictions, confidence_level, adjusted_vol)
+
+def calculate_historical_confidence(df, predictions, confidence_level=95, lookback_days=252, prediction_window=5):
+    if df is None or len(df) < lookback_days:
+        return calculate_proper_confidence_interval(predictions, confidence_level)
+    returns = df['Close'].pct_change().dropna()
+    historical_vol = returns.tail(lookback_days).std()
+    annualized_vol = historical_vol * np.sqrt(252)
+    scaled_vol = annualized_vol * np.sqrt(prediction_window / 252)
+    return calculate_proper_confidence_interval(predictions, confidence_level, scaled_vol)
+
+def fixed_single_ticker_prediction(df, model_predictions, market_condition, market_strength, confidence_level, prediction_window=5):
+    avg_pred = np.mean(list(model_predictions.values()))
+    if df is not None and len(df) > 50:
+        lower, upper = calculate_historical_confidence(df, model_predictions, confidence_level, prediction_window=prediction_window)
+    else:
+        lower, upper = calculate_regime_adjusted_confidence(model_predictions, market_condition, market_strength, confidence_level)
+    return {
+        'prediction': avg_pred,
+        'lower_bound': lower,
+        'upper_bound': upper,
+        'confidence_level': confidence_level
+    }
 
 # Configuration
 CACHE_DURATION = 24 * 60 * 60  # 24 hours in seconds
@@ -1053,19 +1111,16 @@ def predict():
             model_preds = train_model_single(features_df, selected_models, market_condition, market_strength)
             if not model_preds:
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
-            avg_pred = np.mean(list(model_preds.values()))
-            confidence_factor = confidence_interval / 100.0
-            interval_width = 0.05 * (1 - confidence_factor)
-            lower = avg_pred - interval_width
-            upper = avg_pred + interval_width
+            # Use improved confidence interval calculation for single ticker
+            ci = fixed_single_ticker_prediction(df, model_preds, market_condition, market_strength, confidence_interval, prediction_window)
             chart_image = predict_single_ticker_chart(features_df, model_preds, prediction_window)
             response = {
                 'index_prediction': {
                     'ticker': ticker_to_analyze,
                     'index_name': ticker_to_analyze,
-                    'pred': avg_pred,
-                    'lower': lower,
-                    'upper': upper
+                    'pred': ci['prediction'],
+                    'lower': ci['lower_bound'],
+                    'upper': ci['upper_bound']
                 },
                 'selected_models': selected_models,
                 'market_condition': market_condition,
@@ -1117,28 +1172,38 @@ def predict():
             for ticker, model_predictions in trained_models.items():
                 if etf_ticker and ticker == etf_ticker:
                     continue  # Skip the ETF ticker in stock_predictions
-                avg_prediction = np.mean(list(model_predictions.values()))
-                confidence_factor = confidence_interval / 100.0
-                interval_width = 0.05 * (1 - confidence_factor)
-                lower = avg_prediction - interval_width
-                upper = avg_prediction + interval_width
+                # Use improved confidence interval calculation for each stock
+                ci = fixed_single_ticker_prediction(
+                    stock_data.get(ticker),
+                    model_predictions,
+                    market_condition,
+                    market_strength,
+                    confidence_interval,
+                    prediction_window
+                )
                 stock_predictions.append({
                     'ticker': ticker,
-                    'pred': avg_prediction,
-                    'lower': lower,
-                    'upper': upper
+                    'pred': ci['prediction'],
+                    'lower': ci['lower_bound'],
+                    'upper': ci['upper_bound']
                 })
             stock_predictions.sort(key=lambda x: x['pred'], reverse=True)
             stock_predictions = stock_predictions[:num_stocks]
-            
+
             # Use the ETF's own prediction for the main index prediction
             etf_prediction_result = trained_models.get(etf_ticker)
             if etf_ticker and etf_prediction_result:
-                index_prediction = np.mean(list(etf_prediction_result.values()))
-                confidence_factor = confidence_interval / 100.0
-                interval_width = 0.05 * (1 - confidence_factor)
-                index_lower = index_prediction - interval_width
-                index_upper = index_prediction + interval_width
+                ci = fixed_single_ticker_prediction(
+                    stock_data.get(etf_ticker),
+                    etf_prediction_result,
+                    market_condition,
+                    market_strength,
+                    confidence_interval,
+                    prediction_window
+                )
+                index_prediction = ci['prediction']
+                index_lower = ci['lower_bound']
+                index_upper = ci['upper_bound']
                 index_name_for_response = etf_ticker
             else:
                 # Fallback to averaging top 5 stocks if ETF prediction is not available

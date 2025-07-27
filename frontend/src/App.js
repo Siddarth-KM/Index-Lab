@@ -23,12 +23,14 @@ const StockPredictionApp = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [results, setResults] = useState(null);
+
   const [showGraphModal, setShowGraphModal] = useState(false);
   const [openTooltip, setOpenTooltip] = useState(null);
   const [tooltipPos, setTooltipPos] = useState({ top: 0, left: 0 });
   const iconRefs = useRef({});
   const [customTicker, setCustomTicker] = useState('');
   const isCustom = formData.index === 'CUSTOM';
+  // ...existing code...
 
   // --- Effect: Close modal on ESC key ---
   useEffect(() => {
@@ -874,7 +876,7 @@ const StockPredictionApp = () => {
                     <div className="bg-white/10 backdrop-blur-lg rounded-3xl p-8 border border-white/20">
                       <h3 className="text-2xl font-bold text-white mb-6 text-center">Top Stock Predictions</h3>
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {results.stock_predictions.map((stock, index) => (
+                        {[...results.stock_predictions].slice().sort((a, b) => b.pred - a.pred).map((stock, index) => (
                           <div key={stock.ticker} className="bg-gradient-to-br from-slate-800/50 to-slate-700/50 rounded-xl p-4 border border-white/20 hover:border-blue-400/50 transition-all">
                             <div className="text-center">
                               <div className="text-lg font-bold text-white mb-1">{stock.ticker}</div>
