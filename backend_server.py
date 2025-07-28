@@ -958,7 +958,10 @@ def create_multi_stock_prediction_chart(stock_data, stock_predictions, predictio
     plt.axvline(x=0, color='white', linestyle='--', linewidth=2, alpha=0.8)
     plt.xlabel(f"Days (0 = present, -N = history, N = forecast)", color='white')
     plt.ylabel("Normalized Price (Start = 100)", color='white')
-    plt.title(f"Top {len(stock_predictions)} Stock Predictions (window={prediction_window} days)", color='white', fontsize=16)
+    # Get show_type from the current scope if available, default to 'top'
+    show_type = getattr(plt, '_show_type', 'top') if hasattr(plt, '_show_type') else 'top'
+    title_prefix = "Top" if show_type == 'top' else "Worst"
+    plt.title(f"{title_prefix} {len(stock_predictions)} Stock Predictions (window={prediction_window} days)", color='white', fontsize=16)
     plt.legend()
     plt.grid(True, alpha=0.3)
     buffer = io.BytesIO()
@@ -1088,6 +1091,7 @@ def predict():
         confidence_interval = data.get('confidenceInterval', 70)
         model_selection = data.get('modelSelection', 'auto')
         selected_models = data.get('selectedModels', [])
+        show_type = data.get('showType', 'top')
         is_custom = index == 'CUSTOM'
         if is_custom:
             ticker_to_analyze = custom_ticker
@@ -1114,13 +1118,16 @@ def predict():
             # Use improved confidence interval calculation for single ticker
             ci = fixed_single_ticker_prediction(df, model_preds, market_condition, market_strength, confidence_interval, prediction_window)
             chart_image = predict_single_ticker_chart(features_df, model_preds, prediction_window)
+            # Get last close price for the ticker
+            last_close = float(df['Close'].iloc[-1]) if 'Close' in df.columns and not df.empty else None
             response = {
                 'index_prediction': {
                     'ticker': ticker_to_analyze,
                     'index_name': ticker_to_analyze,
                     'pred': ci['prediction'],
                     'lower': ci['lower_bound'],
-                    'upper': ci['upper_bound']
+                    'upper': ci['upper_bound'],
+                    'close': last_close
                 },
                 'selected_models': selected_models,
                 'market_condition': market_condition,
@@ -1168,39 +1175,50 @@ def predict():
                 print(f"ERROR: Could not train models")
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
             print(f"Trained models for {len(trained_models)} stocks")
+
             stock_predictions = []
             for ticker, model_predictions in trained_models.items():
                 if etf_ticker and ticker == etf_ticker:
                     continue  # Skip the ETF ticker in stock_predictions
                 # Use improved confidence interval calculation for each stock
+                stock_df = stock_data.get(ticker)
                 ci = fixed_single_ticker_prediction(
-                    stock_data.get(ticker),
+                    stock_df,
                     model_predictions,
                     market_condition,
                     market_strength,
                     confidence_interval,
                     prediction_window
                 )
+                last_close = float(stock_df['Close'].iloc[-1]) if stock_df is not None and 'Close' in stock_df.columns and not stock_df.empty else None
                 stock_predictions.append({
                     'ticker': ticker,
                     'pred': ci['prediction'],
                     'lower': ci['lower_bound'],
-                    'upper': ci['upper_bound']
+                    'upper': ci['upper_bound'],
+                    'close': last_close
                 })
-            stock_predictions.sort(key=lambda x: x['pred'], reverse=True)
+            # Sort based on showType parameter (default to 'top' if not specified)
+            show_type = data.get('showType', 'top')
+            # Sort predictions:
+            # For 'top': highest predictions first (most positive)
+            # For 'worst': lowest predictions first (most negative)
+            stock_predictions.sort(key=lambda x: x['pred'], reverse=(show_type == 'top'))
             stock_predictions = stock_predictions[:num_stocks]
 
             # Use the ETF's own prediction for the main index prediction
             etf_prediction_result = trained_models.get(etf_ticker)
             if etf_ticker and etf_prediction_result:
+                etf_df = stock_data.get(etf_ticker)
                 ci = fixed_single_ticker_prediction(
-                    stock_data.get(etf_ticker),
+                    etf_df,
                     etf_prediction_result,
                     market_condition,
                     market_strength,
                     confidence_interval,
                     prediction_window
                 )
+                last_close = float(etf_df['Close'].iloc[-1]) if etf_df is not None and 'Close' in etf_df.columns and not etf_df.empty else None
                 index_prediction = ci['prediction']
                 index_lower = ci['lower_bound']
                 index_upper = ci['upper_bound']
@@ -1211,15 +1229,31 @@ def predict():
                 index_lower = np.mean([s['lower'] for s in stock_predictions[:5]]) if stock_predictions else 0
                 index_upper = np.mean([s['upper'] for s in stock_predictions[:5]]) if stock_predictions else 0
                 index_name_for_response = index
+                last_close = None
 
+            # Store show_type temporarily for chart creation
+            plt._show_type = show_type
             chart_image = create_multi_stock_prediction_chart(stock_data, stock_predictions, prediction_window)
+            # Clean up temporary attribute
+            if hasattr(plt, '_show_type'):
+                del plt._show_type
+                
+            # Add rank based on show_type
+            # For both cases, lower rank (1,2,3...) means "better" at what we're looking for
+            # For 'top', rank 1 = highest positive prediction
+            # For 'worst', rank 1 = lowest negative prediction
+            for i, stock in enumerate(stock_predictions):
+                rank = i + 1  # Simple 1-based index for both cases
+                stock['rank'] = rank
+                
             response = {
                 'index_prediction': {
                     'ticker': index_name_for_response,
                     'index_name': index_name_for_response,
                     'pred': index_prediction,
                     'lower': index_lower,
-                    'upper': index_upper
+                    'upper': index_upper,
+                    'close': last_close
                 },
                 'selected_models': selected_models,
                 'market_condition': market_condition,

@@ -16,6 +16,7 @@ const StockPredictionApp = () => {
     customConfidence: '',
     modelSelection: 'auto',
     selectedModels: [],
+    showType: 'top',
   });
   const [showCustomDate, setShowCustomDate] = useState(false);
   const [showCustomConfidence, setShowCustomConfidence] = useState(false);
@@ -86,6 +87,10 @@ const StockPredictionApp = () => {
   const modelSelectionOptions = [
     { value: 'auto', label: 'Auto Select (Market Based)' },
     { value: 'manual', label: 'Manual Selection' }
+  ];
+  const showTypeOptions = [
+    { value: 'top', label: 'Top N Predictions' },
+    { value: 'worst', label: 'Worst N Predictions' }
   ];
   const availableModels = [
     { id: 1, name: 'XGBoost Quantile Regression', description: 'Low vol, precise' },
@@ -207,6 +212,7 @@ const StockPredictionApp = () => {
       confidenceInterval: formData.confidenceInterval === 'custom' ? parseInt(formData.customConfidence) : parseInt(formData.confidenceInterval),
       modelSelection: formData.modelSelection,
       selectedModels: formData.selectedModels,
+      showType: formData.showType,
     };
     try {
       const response = await fetch('/api/predict', {
@@ -223,7 +229,14 @@ const StockPredictionApp = () => {
         setError(errorMessage);
         return;
       }
-      
+
+      // Ensure 'close' field is present in index_prediction and stock_predictions, but do not display it yet
+      if (data.index_prediction && !('close' in data.index_prediction)) {
+        data.index_prediction.close = null;
+      }
+      if (Array.isArray(data.stock_predictions)) {
+        data.stock_predictions = data.stock_predictions.map(sp => ({ ...sp, close: ('close' in sp) ? sp.close : null }));
+      }
       setResults(data);
     } catch (err) {
       setError(err.message || '❌ Network error: Could not connect to the prediction server');
@@ -478,6 +491,29 @@ const StockPredictionApp = () => {
                       <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-300 pointer-events-none" size={20} />
                     </div>
                   </div>
+
+                  {/* Show Type - Only show for non-custom tickers */}
+                  {formData.index !== 'CUSTOM' && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-300 mb-2">
+                        Show
+                      </label>
+                      <div className="relative">
+                        <select
+                          value={formData.showType}
+                          onChange={(e) => handleInputChange('showType', e.target.value)}
+                          className="w-full px-4 py-3 bg-white/5 border border-white/20 rounded-xl text-white focus:border-blue-400 focus:ring-2 focus:ring-blue-400/20 transition-all appearance-none cursor-pointer"
+                        >
+                          {showTypeOptions.map(option => (
+                            <option key={option.value} value={option.value} className="bg-slate-900 text-white">
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-300 pointer-events-none" size={20} />
+                      </div>
+                    </div>
+                  )}
 
                   {/* Custom Confidence Interval */}
                   {showCustomConfidence && (
@@ -772,6 +808,9 @@ const StockPredictionApp = () => {
                               <div className="text-gray-300 text-sm">
                                 Confidence Interval: {results.index_prediction && results.index_prediction.lower !== undefined && results.index_prediction.upper !== undefined ? `${(results.index_prediction.lower * 100).toFixed(2)}% - ${(results.index_prediction.upper * 100).toFixed(2)}%` : '--'}
                               </div>
+                              <div className="text-gray-300 text-sm">
+                                Last Close: {results.index_prediction && results.index_prediction.close !== null ? `$${results.index_prediction.close.toFixed(2)}` : '--'}
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -868,21 +907,27 @@ const StockPredictionApp = () => {
                           <div className="text-gray-300 text-sm">
                                 Confidence Interval: {results.index_prediction && results.index_prediction.lower !== undefined && results.index_prediction.upper !== undefined ? `${(results.index_prediction.lower * 100).toFixed(2)}% - ${(results.index_prediction.upper * 100).toFixed(2)}%` : '--'}
                           </div>
+                          <div className="text-gray-300 text-sm">
+                                Last Close: {results.index_prediction && results.index_prediction.close !== null ? `$${results.index_prediction.close.toFixed(2)}` : '--'}
+                          </div>
                       </div>
                     </div>
                     </div>
                         {/* Stock Predictions (move above graph) */}
                   {results.stock_predictions && results.stock_predictions.length > 0 && (
                     <div className="bg-white/10 backdrop-blur-lg rounded-3xl p-8 border border-white/20">
-                      <h3 className="text-2xl font-bold text-white mb-6 text-center">Top Stock Predictions</h3>
+                      <h3 className="text-2xl font-bold text-white mb-6 text-center">
+                        {formData.showType === 'top' ? 'Top' : 'Worst'} Stock Predictions
+                      </h3>
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {[...results.stock_predictions].slice().sort((a, b) => b.pred - a.pred).map((stock, index) => (
+                        {results.stock_predictions.map((stock, index) => (
                           <div key={stock.ticker} className="bg-gradient-to-br from-slate-800/50 to-slate-700/50 rounded-xl p-4 border border-white/20 hover:border-blue-400/50 transition-all">
                             <div className="text-center">
                               <div className="text-lg font-bold text-white mb-1">{stock.ticker}</div>
                               <div className={`text-2xl font-bold mb-1 ${stock.pred > 0 ? 'text-green-400' : 'text-red-400'}`}>{(stock.pred * 100).toFixed(2)}%</div>
                               <div className="text-xs text-gray-400">{(stock.lower * 100).toFixed(1)}% - {(stock.upper * 100).toFixed(1)}%</div>
-                              <div className="text-xs text-blue-300 mt-1">Rank #{index + 1}</div>
+                              <div className="text-xs text-gray-400">Last Close: {stock.close !== null ? `$${stock.close.toFixed(2)}` : '--'}</div>
+                              <div className="text-xs text-blue-300">Rank #{index + 1}</div>
                             </div>
                           </div>
                         ))}
