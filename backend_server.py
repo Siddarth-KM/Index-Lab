@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
@@ -19,8 +18,10 @@ import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 warnings.filterwarnings('ignore')
-from ta.trend import ADXIndicator, EMAIndicator
+from ta.trend import EMAIndicator
+from ta.trend import IchimokuIndicator
 from ta.momentum import RSIIndicator, ROCIndicator
+from ta.trend import MACD
 from ta.volatility import AverageTrueRange
 from ta.volume import OnBalanceVolumeIndicator
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, AdaBoostRegressor
@@ -31,6 +32,9 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import xgboost as xgb
 # Removed TensorFlow and PyTorch imports - using scikit-learn alternatives
 import matplotlib.cm as cm
+from ta.momentum import WilliamsRIndicator, StochasticOscillator
+from ta.volatility import BollingerBands
+from ta.volume import ChaikinMoneyFlowIndicator, AccDistIndexIndicator
 from bs4.element import Tag
 from scipy import stats
 app = Flask(__name__)
@@ -81,12 +85,20 @@ def calculate_historical_confidence(df, predictions, confidence_level=95, lookba
     scaled_vol = annualized_vol * np.sqrt(prediction_window / 252)
     return calculate_proper_confidence_interval(predictions, confidence_level, scaled_vol)
 
+def ensure_iterable(obj):
+    """Ensure the object is iterable. If not, wrap it in a list."""
+    if isinstance(obj, (list, np.ndarray, pd.Series)):
+        return obj
+    return [obj]
+
 def fixed_single_ticker_prediction(df, model_predictions, market_condition, market_strength, confidence_level, prediction_window=5):
-    avg_pred = np.mean(list(model_predictions.values()))
+    """Calculate prediction and confidence intervals for a single ticker."""
+    avg_preds = [v['avg_pred'] if isinstance(v, dict) and 'avg_pred' in v else v for v in ensure_iterable(model_predictions.values()) if not isinstance(v, str)]
+    avg_pred = np.mean(avg_preds) if avg_preds else 0.0
     if df is not None and len(df) > 50:
-        lower, upper = calculate_historical_confidence(df, model_predictions, confidence_level, prediction_window=prediction_window)
+        lower, upper = calculate_historical_confidence(df, avg_pred, confidence_level, prediction_window=prediction_window)
     else:
-        lower, upper = calculate_regime_adjusted_confidence(model_predictions, market_condition, market_strength, confidence_level)
+        lower, upper = calculate_regime_adjusted_confidence(avg_pred, market_condition, market_strength, confidence_level)
     return {
         'prediction': avg_pred,
         'lower_bound': lower,
@@ -179,7 +191,7 @@ def scrape_index_constituents(index_name, force_refresh=False):
     # Hardcoded SPLV tickers (since not available on Wikipedia)
     SPLV_TICKERS = [
         "EVRG", "ATO", "CMS", "WEC", "SO", "DUK", "PNW", "PPL", "LNT", "NI", "AEP", "DTE", "AEE", "EXC", "XEL", "ED", "FE", "PEG", "CNP",
-        "CME", "ICE", "MMC", "WTW", "JKHY", "BRK/B", "L", "SPGI", "MA", "V", "FDS", "AON", "CB", "BRO", "CBOE", "AFL", "AJG",
+        "CME", "ICE", "MMC", "WTW", "JKHY", "BRKB", "L", "SPGI", "MA", "V", "FDS", "AON", "CB", "BRO", "CBOE", "AFL", "AJG",
         "KO", "CHD", "PG", "PEP", "KDP", "KMB", "MO", "SYY", "CL", "MDLZ", "TSN", "MKC", "COST", "GIS", "CLX",
         "LHX", "RSG", "ADP", "GD", "ITW", "VLTO", "UNP", "WM", "BR", "OTIS", "VRSK", "GWW", "ROL", "PAYX",
         "O", "VICI", "REG", "WELL", "AVB", "FRT", "CPT", "MAA", "VTR", "UDR", "EQR", "INVH",
@@ -398,7 +410,6 @@ def detect_market_regime(etf_df):
     if 'SMA_50' not in df:
         df['SMA_50'] = flatten_series(df['Close'].rolling(window=50).mean())
     if 'macd' not in df or 'macd_signal' not in df:
-        from ta.trend import MACD
         macd = MACD(close=df['Close'])
         macd_val_raw = macd.macd()
         macd_signal_raw = macd.macd_signal()
@@ -482,100 +493,176 @@ def calc_slope(x):
 def add_features_to_stock(ticker, df, prediction_window=5):
     """Add features to a single stock's data, with N-day lookahead and 30 total indicators (5 per group)."""
     if df is None or len(df) < 50:
+        print(f"[add_features_to_stock] {ticker}: DataFrame is None or too short ({len(df) if df is not None else 0} rows)")
         return None
     try:
         df = df.copy()
-        df['close_series'] = df['Close']
-        df['high_series'] = df['High']
-        df['low_series'] = df['Low']
-        df['volume_series'] = df['Volume']
+        # Convert price series to float and handle missing data
+        try:
+            for col in ['Close', 'High', 'Low', 'Volume']:
+                if col not in df.columns:
+                    print(f"[add_features_to_stock] {ticker}: Missing required column {col}")
+                    return None
+                df[f'{col.lower()}_series'] = pd.to_numeric(df[col], errors='coerce')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error converting price data: {e}")
+            return None
+
+        # Initialize features list to track successful calculations
+        calculated_features = []
+
         # --- Momentum ---
-        df['RSI'] = flatten_series(RSIIndicator(close=df['close_series']).rsi())
-        df['roc_10'] = flatten_series(ROCIndicator(close=df['close_series']).roc())
-        df['momentum'] = flatten_series(df['close_series'] - df['close_series'].shift(10))
-        df['rsi_14_diff'] = flatten_series(df['RSI'] - df['RSI'].shift(5))
-        from ta.momentum import WilliamsRIndicator
-        df['williams_r'] = flatten_series(WilliamsRIndicator(high=df['high_series'], low=df['low_series'], close=df['close_series'], lbp=14).williams_r())
-        # --- Mean Reversion ---
-        df['SMA_20'] = flatten_series(df['close_series'].rolling(window=20).mean().shift(1))
-        df['SD'] = flatten_series(df['close_series'].rolling(window=20).std().shift(1))
-        df['Upper'] = flatten_series(df['SMA_20'] + 2*df['SD'])
-        df['Lower'] = flatten_series(df['SMA_20'] - 2*df['SD'])
-        df['percent_b'] = flatten_series((df['close_series'] - df['Lower']) / (df['Upper'] - df['Lower']))
-        rolling_mean = flatten_series(df['close_series'].rolling(window=10).mean())
-        df['z_score_close'] = flatten_series((df['close_series'] - rolling_mean) / df['close_series'].rolling(window=10).std())
+        try:
+            rsi = RSIIndicator(close=df['close_series'])
+            df['RSI'] = pd.Series(rsi.rsi(), index=df.index)
+            calculated_features.append('RSI')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating RSI: {e}")
+
+        try:
+            df['roc_10'] = flatten_series(ROCIndicator(close=df['close_series']).roc())
+            calculated_features.append('roc_10')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating ROC: {e}")
+
+        try:
+            df['momentum'] = flatten_series(df['close_series'] - df['close_series'].shift(10))
+            calculated_features.append('momentum')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating momentum: {e}")
+
+        try:
+            df['rsi_14_diff'] = flatten_series(df['RSI'] - df['RSI'].shift(5))
+            calculated_features.append('rsi_14_diff')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating RSI difference: {e}")
+
         # --- Trend ---
-        from ta.trend import MACD, EMAIndicator
-        macd = MACD(close=df['close_series'])
-        df['macd'] = flatten_series(macd.macd().squeeze())
-        df['macd_signal'] = flatten_series(macd.macd_signal().squeeze())
-        df['ema_diff'] = flatten_series((df['macd'] - df['macd_signal']).squeeze())
-        # Calculate slope_price_10d: slope of close price over last 10 days
-        def calc_slope(x):
-            if len(x) < 2 or np.any(np.isnan(x)):
-                return np.nan
-            y = np.array(x)
-            x_vals = np.arange(len(y))
-            A = np.vstack([x_vals, np.ones(len(x_vals))]).T
-            m, _ = np.linalg.lstsq(A, y, rcond=None)[0]
-            return m
-        df['slope_price_10d'] = flatten_series(df['close_series'].rolling(window=10).apply(calc_slope, raw=False))
-        # Calculate ema_ratio: ratio of close to EMA_10
-        ema_10 = flatten_series(EMAIndicator(close=df['close_series'], window=10).ema_indicator())
-        df['ema_ratio'] = flatten_series(df['close_series'] / ema_10)
-        # Normalize MACD features to mean=0, std=1 (z-score)
-        for col in ['macd', 'macd_signal', 'ema_diff']:
-            series = df[col]
-            df[col] = flatten_series((series - series.mean()) / (series.std() if series.std() != 0 else 1))
+        try:
+            macd = MACD(close=df['close_series'])
+            df['macd'] = flatten_series(macd.macd().squeeze())
+            df['macd_signal'] = flatten_series(macd.macd_signal().squeeze())
+            df['ema_diff'] = flatten_series((df['macd'] - df['macd_signal']).squeeze())
+            calculated_features.extend(['macd', 'macd_signal', 'ema_diff'])
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating MACD: {e}")
+
+        try:
+            df['slope_price_10d'] = flatten_series(df['close_series'].rolling(window=10).apply(calc_slope, raw=False))
+            calculated_features.append('slope_price_10d')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating slope of price: {e}")
+
+        try:
+            ema_10 = flatten_series(EMAIndicator(close=df['close_series'], window=10).ema_indicator())
+            df['ema_ratio'] = flatten_series(df['close_series'] / ema_10)
+            calculated_features.append('ema_ratio')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating EMA ratio: {e}")
+
+        try:
+            for col in ['macd', 'macd_signal', 'ema_diff']:
+                series = df[col]
+                df[col] = flatten_series((series - series.mean()) / (series.std() if series.std() != 0 else 1))
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error normalizing MACD features: {e}")
+
         # --- Momentum ---
-        from ta.momentum import StochasticOscillator
-        stoch = StochasticOscillator(high=df['high_series'], low=df['low_series'], close=df['close_series'])
-        df['stoch_k'] = flatten_series(stoch.stoch().squeeze())
-        # Normalize stoch_k to 0-100
-        if df['stoch_k'].max() != df['stoch_k'].min():
-            df['stoch_k'] = flatten_series(100 * (df['stoch_k'] - df['stoch_k'].min()) / (df['stoch_k'].max() - df['stoch_k'].min()))
-        else:
-            df['stoch_k'] = flatten_series(50)  # fallback if constant
+        try:
+            stoch = StochasticOscillator(high=df['high_series'], low=df['low_series'], close=df['close_series'])
+            df['stoch_k'] = flatten_series(stoch.stoch().squeeze())
+            if df['stoch_k'].max() != df['stoch_k'].min():
+                df['stoch_k'] = flatten_series(100 * (df['stoch_k'] - df['stoch_k'].min()) / (df['stoch_k'].max() - df['stoch_k'].min()))
+            else:
+                df['stoch_k'] = flatten_series(50)  # fallback if constant
+            calculated_features.append('stoch_k')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating Stochastic Oscillator: {e}")
+
         # --- Volatility ---
-        from ta.volatility import BollingerBands
-        df['ATR'] = flatten_series(AverageTrueRange(high=df['high_series'], low=df['low_series'], close=df['close_series']).average_true_range())
-        df['volatility'] = flatten_series(np.log(df['close_series'] / df['close_series'].shift(1)).rolling(10).std())
-        df['rolling_20d_std'] = flatten_series(df['close_series'].rolling(window=20).std())
-        bb = BollingerBands(close=df['close_series'])
-        df['bb_width'] = flatten_series(bb.bollinger_wband())
-        df['donchian_width'] = flatten_series(df['high_series'].rolling(window=20).max() - df['low_series'].rolling(window=20).min())
+        try:
+            df['ATR'] = flatten_series(AverageTrueRange(high=df['high_series'], low=df['low_series'], close=df['close_series']).average_true_range())
+            calculated_features.append('ATR')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating ATR: {e}")
+
+        try:
+            df['volatility'] = flatten_series(np.log(df['close_series'] / df['close_series'].shift(1)).rolling(10).std())
+            calculated_features.append('volatility')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating volatility: {e}")
+
+        try:
+            df['rolling_20d_std'] = flatten_series(df['close_series'].rolling(window=20).std())
+            calculated_features.append('rolling_20d_std')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating rolling standard deviation: {e}")
+
+        try:
+            bb = BollingerBands(close=df['close_series'])
+            df['bb_width'] = flatten_series(bb.bollinger_wband())
+            calculated_features.append('bb_width')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating Bollinger Band width: {e}")
+
+        try:
+            df['donchian_width'] = flatten_series(df['high_series'].rolling(window=20).max() - df['low_series'].rolling(window=20).min())
+            calculated_features.append('donchian_width')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating Donchian width: {e}")
+
         # --- Volume ---
-        df['OBV'] = flatten_series(OnBalanceVolumeIndicator(close=df['close_series'], volume=df['volume_series']).on_balance_volume())
-        df['volume_pct_change'] = flatten_series(df['Volume'].pct_change())
-        from ta.volume import ChaikinMoneyFlowIndicator, AccDistIndexIndicator
-        df['cmf'] = flatten_series(ChaikinMoneyFlowIndicator(high=df['high_series'], low=df['low_series'], close=df['close_series'], volume=df['volume_series']).chaikin_money_flow())
-        df['adl'] = flatten_series(AccDistIndexIndicator(high=df['high_series'], low=df['low_series'], close=df['close_series'], volume=df['volume_series']).acc_dist_index())
+        try:
+            df['OBV'] = flatten_series(OnBalanceVolumeIndicator(close=df['close_series'], volume=df['volume_series']).on_balance_volume())
+            calculated_features.append('OBV')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating OBV: {e}")
+
+        try:
+            df['volume_pct_change'] = flatten_series(df['Volume'].pct_change())
+            calculated_features.append('volume_pct_change')
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating volume percentage change: {e}")
+
         # --- Other/Composite ---
-        df['close_lag_1'] = flatten_series(df['Close'].shift(1))
-        df['close_lag_5'] = flatten_series(df['Close'].shift(5))
-        df['past_10d_return'] = flatten_series(df['close_series'] / df['close_series'].shift(10) - 1)
-        df[f'close_lead_{prediction_window}'] = flatten_series(df['Close'].shift(-prediction_window))
-        df[f'forward_return_{prediction_window}'] = flatten_series((df['Close'].shift(-prediction_window) / df['Close']) - 1)
-        df[f'rolling_max_{prediction_window}'] = flatten_series(df['Close'].rolling(window=prediction_window).max())
-        df[f'rolling_min_{prediction_window}'] = flatten_series(df['Close'].rolling(window=prediction_window).min())
-        # --- Ichimoku ---
-        from ta.trend import IchimokuIndicator
-        ichimoku = IchimokuIndicator(high=df['high_series'], low=df['low_series'], window1=9, window2=26, window3=52, fillna=True)
-        df['ichimoku_a'] = flatten_series(ichimoku.ichimoku_a())
-        df['ichimoku_b'] = flatten_series(ichimoku.ichimoku_b())
-        df['ichimoku_base'] = flatten_series(ichimoku.ichimoku_base_line())
+        try:
+            df['close_lag_1'] = flatten_series(df['Close'].shift(1))
+            df['close_lag_5'] = flatten_series(df['Close'].shift(5))
+            df['past_10d_return'] = flatten_series(df['close_series'] / df['close_series'].shift(10) - 1)
+            df[f'close_lead_{prediction_window}'] = flatten_series(df['Close'].shift(-prediction_window))
+            df[f'forward_return_{prediction_window}'] = flatten_series((df['Close'].shift(-prediction_window) / df['Close']) - 1)
+            df[f'rolling_max_{prediction_window}'] = flatten_series(df['Close'].rolling(window=prediction_window).max())
+            df[f'rolling_min_{prediction_window}'] = flatten_series(df['Close'].rolling(window=prediction_window).min())
+            calculated_features.extend(['close_lag_1', 'close_lag_5', 'past_10d_return', f'close_lead_{prediction_window}', f'forward_return_{prediction_window}', f'rolling_max_{prediction_window}', f'rolling_min_{prediction_window}'])
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating composite features: {e}")
+
+        try:
+            ichimoku = IchimokuIndicator(high=df['high_series'], low=df['low_series'], window1=9, window2=26, window3=52, fillna=True)
+            df['ichimoku_a'] = flatten_series(ichimoku.ichimoku_a())
+            df['ichimoku_b'] = flatten_series(ichimoku.ichimoku_b())
+            df['ichimoku_base'] = flatten_series(ichimoku.ichimoku_base_line())
+            calculated_features.extend(['ichimoku_a', 'ichimoku_b', 'ichimoku_base'])
+        except Exception as e:
+            print(f"[add_features_to_stock] {ticker}: Error calculating Ichimoku features: {e}")
+
         # Drop rows with NaN for rolling features, but NOT for close_lead_N, forward_return_N, rolling_max/min
-        feature_cols = [
-            'RSI', 'roc_10', 'momentum', 'rsi_14_diff', 'williams_r', 'stoch_k',
-            'SMA_20', 'SD', 'Upper', 'Lower', 'percent_b', 'z_score_close',
-            'macd', 'macd_signal', 'slope_price_10d', 'ema_diff', 'ema_ratio',
-            'ATR', 'volatility', 'rolling_20d_std', 'bb_width', 'donchian_width',
-            'OBV', 'volume_pct_change', 'cmf', 'adl', 'ichimoku_a', 'ichimoku_b', 'ichimoku_base',
-            'close_lag_1', 'close_lag_5', 'past_10d_return'
-        ]
+        feature_cols = calculated_features
+
+        # Add lagged features for selected indicators
+        lag_features = ['RSI', 'macd', 'stoch_k', 'ATR', 'rolling_20d_std', 'percent_b', 'OBV', 'cmf']
+        num_lags = 3
+        for feat in lag_features:
+            for lag in range(1, num_lags+1):
+                col_name = f'{feat}_lag{lag}'
+                if col_name in df.columns:
+                    feature_cols.append(col_name)
         df = df.dropna(subset=feature_cols)
         return df
     except Exception as e:
+        print(f"[add_features_to_stock] ERROR for {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def add_features_parallel(stock_data, prediction_window=5):
@@ -620,6 +707,15 @@ def get_indicator_weights(regime, regime_strength):
         # Other/Composite
         'close_lag_1': 'other', 'close_lag_5': 'other', 'past_10d_return': 'other',
     }
+    # Add lagged features to group_map
+    lag_features = {
+        'RSI': 'momentum', 'macd': 'trend', 'stoch_k': 'momentum', 'ATR': 'volatility',
+        'rolling_20d_std': 'volatility', 'percent_b': 'mean_reversion', 'OBV': 'volume', 'cmf': 'volume'
+    }
+    num_lags = 3
+    for base, group in lag_features.items():
+        for lag in range(1, num_lags+1):
+            group_map[f'{base}_lag{lag}'] = group
     regime = regime if regime in base_weights else 'sideways'
     weights = {}
     for feature, group in group_map.items():
@@ -641,20 +737,58 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                 df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (np.ndarray, list)) and len(x) == 1 else (x if np.isscalar(x) else float(np.asarray(x).flatten()[0])))
             df[col] = pd.to_numeric(df[col], errors='coerce')
         X = df[feature_columns].values.astype(float)
-        y = df['Close'].pct_change().shift(-1).values  # Next day return
-        valid_indices = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X = X[valid_indices]
-        y = y[valid_indices]
-        if len(X) < 20:
-            return None
+        # Prepare targets for N, N+1, N+2 day lookahead
+        y_N = df['Close'].pct_change().shift(-1).values  # N=1 day
+        y_N1 = df['Close'].pct_change(periods=2).shift(-2).values  # N+1=2 days
+        y_N2 = df['Close'].pct_change(periods=3).shift(-3).values  # N+2=3 days
+        preds_dict = {}
+        for model_id in model_ids:
+            preds = []
+            for y_target in [y_N, y_N1, y_N2]:
+                valid_indices = ~(np.isnan(X).any(axis=1) | np.isnan(y_target))
+                X_valid = X[valid_indices]
+                y_valid = y_target[valid_indices]
+                if len(X_valid) < 20:
+                    preds.append(0.0)
+                    continue
+                pred = train_and_predict_model(X_valid, y_valid, model_id)
+                preds.append(pred[-1])
+            avg_pred = float(np.mean(preds))
+            preds_dict[model_id] = {
+                'avg_pred': avg_pred,
+                'all_preds': preds
+            }
+        return preds_dict
         if regime is not None:
             weights_dict = get_indicator_weights(regime, regime_strength)
             weights = [weights_dict.get(f, 1.0) for f in feature_columns]
             X = X * weights
         model_predictions = {}
+        # Rolling predictions for multiple windows
+        rolling_windows = [1, 2, 3, 5]
+        rolling_preds = {}
+        for win in rolling_windows:
+            # Prepare target for each window
+            y_win = df['Close'].pct_change(periods=win).shift(-win).values
+            valid_indices_win = ~(np.isnan(X).any(axis=1) | np.isnan(y_win))
+            X_win = X[valid_indices_win]
+            y_win = y_win[valid_indices_win]
+            if len(X_win) < 20:
+                rolling_preds[win] = None
+                continue
+            preds_win = {}
+            for model_id in model_ids:
+                preds_win[model_id] = train_and_predict_model(X_win, y_win, model_id)
+            rolling_preds[win] = preds_win
+        # Standard prediction for requested window: predict for last 3 days (N, N+1, N+2)
         for model_id in model_ids:
-            prediction = train_and_predict_model(X, y, model_id)
-            model_predictions[model_id] = prediction
+            preds = train_and_predict_model(X, y_N, model_id)
+            avg_pred = float(np.mean(preds)) if len(preds) > 0 else 0.0
+            model_predictions[model_id] = {
+                'avg_pred': avg_pred,
+                'all_preds': preds
+            }
+        model_predictions['rolling_windows'] = rolling_preds
         return model_predictions
     except Exception as e:
         print(f"Error training models for {ticker}: {e}")
@@ -685,33 +819,49 @@ class TransformerModel:
         X_scaled = self.scaler.transform(X)
         return self.model.predict(X_scaled)
 
+# Utility to ensure prediction is always a list
+def ensure_list(pred):
+    if pred is None:
+        return [0.0]
+    if isinstance(pred, (list, np.ndarray)):
+        return list(pred)
+    try:
+        return [float(pred)]
+    except Exception:
+        return [0.0]
+
 def train_and_predict_model(X, y, model_id):
     """Train actual ML model and make prediction, with feature scaling."""
-    if len(X) < 50:  # Need sufficient data
-        return 0.0
+    def _predict_last_n(X, model, scaler, n=1):
+        # Predict for the last n rows
+        if n > len(X):
+            n = len(X)
+        X_predict = X[-n:]
+        X_predict_scaled = scaler.transform(X_predict)
+        preds = model.predict(X_predict_scaled)
+        return preds
+
+    if len(X) < 50:
+        return [0.0] * 3
     try:
-        # Prepare data
         X = np.array(X)
         y = np.array(y)
-        # Remove any remaining NaN values
         valid_mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
         X = X[valid_mask]
         y = y[valid_mask]
         if len(X) < 20:
-            return 0.0
-        # Split data (use all historical data for training, predict current)
-        X_train = X[:-1]  # All but last row
-        y_train = y[:-1]  # All but last row
-        X_predict = X[-1:]  # Last row for prediction
+            return [0.0] * 3
+        X_train = X[:-3] if len(X) > 3 else X[:-1]
+        y_train = y[:-3] if len(y) > 3 else y[:-1]
+        # For prediction, use last 3 rows
         # Choose scaler
-        if model_id in [3, 6, 7, 9, 10]:  # Neural net, regression, SVR, ElasticNet, Transformer
+        if model_id in [3, 6, 7, 9, 10]:
             scaler = StandardScaler()
         else:
             scaler = MinMaxScaler()
         X_train_scaled = scaler.fit_transform(X_train)
-        X_predict_scaled = scaler.transform(X_predict)
-        # Train model based on model_id
-        if model_id == 1:  # XGBoost Quantile Regression
+        model = None
+        if model_id == 1:
             model = xgb.XGBRegressor(
                 objective='reg:quantileerror',
                 quantile_alpha=0.5,
@@ -720,18 +870,14 @@ def train_and_predict_model(X, y, model_id):
                 learning_rate=0.1,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 2:  # Random Forest Bootstrap
+        elif model_id == 2:
             model = RandomForestRegressor(
                 n_estimators=100,
                 max_depth=10,
                 bootstrap=True,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 3:  # Neural Network Conformal
+        elif model_id == 3:
             model = MLPRegressor(
                 hidden_layer_sizes=(100, 50, 25),
                 activation='relu',
@@ -740,69 +886,62 @@ def train_and_predict_model(X, y, model_id):
                 max_iter=500,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 4:  # Extra Trees Bootstrap
+        elif model_id == 4:
             model = ExtraTreesRegressor(
                 n_estimators=100,
                 max_depth=10,
                 bootstrap=True,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 5:  # AdaBoost Conformal
+        elif model_id == 5:
             model = AdaBoostRegressor(
                 n_estimators=100,
                 learning_rate=0.1,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 6:  # Bayesian Ridge Conformal
+        elif model_id == 6:
             model = BayesianRidge(
                 alpha_1=1e-6,
                 alpha_2=1e-6,
                 lambda_1=1e-6,
                 lambda_2=1e-6
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 7:  # Support Vector Regression
+        elif model_id == 7:
             model = SVR(
                 kernel='rbf',
                 C=1.0,
                 epsilon=0.1
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 8:  # Gradient Boosting Conformal
+        elif model_id == 8:
             model = GradientBoostingRegressor(
                 n_estimators=100,
                 learning_rate=0.1,
                 max_depth=6,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 9:  # Elastic Net Conformal
+        elif model_id == 9:
             model = ElasticNet(
                 alpha=0.1,
                 l1_ratio=0.5,
                 random_state=42
             )
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
-        elif model_id == 10:  # Transformer (scikit-learn alternative)
+        elif model_id == 10:
             model = TransformerModel(input_dim=X_train_scaled.shape[1])
-            model.fit(X_train_scaled, y_train)
-            prediction = model.predict(X_predict_scaled)[0]
         else:
-            return 0.0
-        return prediction
+            return [0.0] * 3
+        model.fit(X_train_scaled, y_train)
+        # Use last 3 rows for prediction
+        n_preds = 3
+        X_predict = X[-n_preds:]
+        X_predict_scaled = scaler.transform(X_predict)
+        preds = model.predict(X_predict_scaled)
+        preds = ensure_iterable(preds)  # Ensure predictions are iterable
+        if len(preds) < 3:
+            preds = [0.0] * (3 - len(preds)) + preds
+        return preds
     except Exception as e:
         print(f"Error training model {model_id}: {e}")
-        return 0.0
+        return [0.0] * 3
 
 def train_models_parallel(stock_data, model_ids, regime=None, regime_strength=0.5):
     """Train models for all stocks using parallel processing, with regime-aware feature weighting."""
@@ -828,19 +967,14 @@ def simulate_prediction_model(df, model_id, prediction_window, confidence_interv
     """Simulate prediction using different model types"""
     if df is None or len(df) < 50:
         return None, None, None
-    
     # Calculate all technical indicators
     df = add_features_to_stock('TICKER', df, prediction_window)
-    
     # Get recent data for prediction
     recent = df.tail(30).dropna()
-    
     if len(recent) < 20:
         return None, None, None
-    
     # Simulate different model behaviors based on technical indicators
     base_prediction = np.random.normal(0.02, 0.05)  # 2% average return
-    
     # Use technical indicators to adjust prediction
     if not recent.empty:
         # RSI-based adjustment
@@ -849,58 +983,38 @@ def simulate_prediction_model(df, model_id, prediction_window, confidence_interv
             base_prediction *= 0.8  # Overbought, reduce prediction
         elif current_rsi < 30:
             base_prediction *= 1.2  # Oversold, increase prediction
-        
         # Momentum-based adjustment
         momentum = recent['momentum'].iloc[-1] if not pd.isna(recent['momentum'].iloc[-1]) else 0
         if momentum > 0:
             base_prediction *= 1.1
         else:
             base_prediction *= 0.9
-        
         # Volatility-based adjustment
         volatility = recent['volatility'].iloc[-1] if not pd.isna(recent['volatility'].iloc[-1]) else 0.02
         if volatility > 0.03:
             base_prediction *= 0.8  # High volatility, reduce prediction
         elif volatility < 0.01:
             base_prediction *= 1.1  # Low volatility, increase prediction
-    
-    # Adjust based on model type
-    if model_id in [1, 4, 8]:  # Aggressive models
-        base_prediction *= 1.3
-    elif model_id in [6, 9]:   # Conservative models
-        base_prediction *= 0.7
-    
     # Add market condition influence
     market_condition, _ = calculate_market_condition(df)
     if market_condition == 'bull':
         base_prediction += 0.01
     elif market_condition == 'bear':
         base_prediction -= 0.01
-    
-    # Calculate confidence interval
-    confidence_factor = confidence_interval / 100.0
-    interval_width = 0.05 * (1 - confidence_factor)  # Wider interval for lower confidence
-    lower = base_prediction - interval_width
-    upper = base_prediction + interval_width
-    return base_prediction, lower, upper
-
 def create_prediction_chart(df, prediction, lower, upper, ticker_name):
     """Create a matplotlib chart showing prediction"""
     plt.figure(figsize=(12, 8))
     plt.style.use('dark_background')
-    
     # Plot historical data
     if df is not None and len(df) > 0:
         dates = df.index[-50:]  # Last 50 days
         prices = df['Close'][-50:]
         plt.plot(dates, prices, 'white', linewidth=2, label='Historical Price')
-    
     # Add prediction point
     if df is not None and len(df) > 0:
         last_date = df.index[-1]
         future_date = last_date + timedelta(days=5)
         current_price = df['Close'].iloc[-1]
-        
         # Plot prediction
         plt.scatter(future_date, current_price * (1 + prediction), 
                    color='green', s=100, zorder=5, label=f'Prediction: {prediction*100:.2f}%')
@@ -1291,4 +1405,4 @@ if __name__ == '__main__':
     print("Available endpoints:")
     print("- POST /api/predict - Main prediction endpoint")
     print("- GET /api/health - Health check")
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=5000)
