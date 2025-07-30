@@ -15,6 +15,8 @@ import time
 import os
 import json
 import pickle
+import traceback
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 warnings.filterwarnings('ignore')
@@ -35,10 +37,108 @@ import matplotlib.cm as cm
 from ta.momentum import WilliamsRIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
 from ta.volume import ChaikinMoneyFlowIndicator, AccDistIndexIndicator
+from bs4 import BeautifulSoup
 from bs4.element import Tag
 from scipy import stats
 app = Flask(__name__)
 CORS(app)
+
+def ensure_iterable(obj):
+    """Ensure the object is iterable. If not, wrap it in a list."""
+    if isinstance(obj, (list, np.ndarray, pd.Series)):
+        return obj
+    return [obj]
+
+def validate_prediction_bounds(prediction, ticker, historical_data=None, strict_mode=True):
+    """
+    Validate prediction against historical bounds and market reality.
+    Returns validated prediction and warning flags.
+    """
+    try:
+        original_pred = float(prediction)
+        validated_pred = original_pred
+        warnings = []
+        
+        # Define absolute bounds based on market reality
+        if strict_mode:
+            max_daily_return = 0.20   # 20% max daily move (very conservative)
+            normal_daily_limit = 0.10  # 10% for normal market conditions
+        else:
+            max_daily_return = 0.30   # 30% max daily move (less conservative)
+            normal_daily_limit = 0.15  # 15% for normal market conditions
+        
+        # Check absolute bounds
+        if abs(original_pred) > max_daily_return:
+            validated_pred = np.sign(original_pred) * max_daily_return
+            warnings.append(f"EXTREME: Prediction {original_pred*100:.2f}% clamped to {validated_pred*100:.2f}%")
+        elif abs(original_pred) > normal_daily_limit:
+            # Apply soft clamping for large but not extreme predictions
+            excess = abs(original_pred) - normal_daily_limit
+            damping_factor = 0.5  # Reduce excess by 50%
+            validated_pred = np.sign(original_pred) * (normal_daily_limit + excess * damping_factor)
+            warnings.append(f"LARGE: Prediction {original_pred*100:.2f}% damped to {validated_pred*100:.2f}%")
+        
+        # Historical bounds checking if data is available
+        if historical_data is not None and len(historical_data) > 50:
+            try:
+                # Calculate historical daily returns
+                daily_returns = historical_data['Close'].pct_change().dropna()
+                
+                if len(daily_returns) > 30:
+                    # Historical percentiles
+                    hist_99 = np.percentile(daily_returns, 99)
+                    hist_1 = np.percentile(daily_returns, 1)
+                    hist_95 = np.percentile(daily_returns, 95)
+                    hist_5 = np.percentile(daily_returns, 5)
+                    
+                    # Check against historical extremes (99th/1st percentile)
+                    if validated_pred > hist_99 * 1.5:  # 1.5x historical extreme
+                        validated_pred = hist_99 * 1.2  # Cap at 1.2x historical extreme
+                        warnings.append(f"HISTORICAL: Prediction above 1.5x historical 99th percentile, capped")
+                    elif validated_pred < hist_1 * 1.5:
+                        validated_pred = hist_1 * 1.2
+                        warnings.append(f"HISTORICAL: Prediction below 1.5x historical 1st percentile, capped")
+                    
+                    # Check against normal historical range (95th/5th percentile)
+                    elif validated_pred > hist_95 * 2.0:
+                        validated_pred = hist_95 * 1.5
+                        warnings.append(f"RANGE: Prediction above 2x historical 95th percentile, reduced")
+                    elif validated_pred < hist_5 * 2.0:
+                        validated_pred = hist_5 * 1.5
+                        warnings.append(f"RANGE: Prediction below 2x historical 5th percentile, reduced")
+                        
+            except Exception as e:
+                warnings.append(f"Historical validation failed: {e}")
+        
+        # Sanity check: predictions should not be exactly zero unless intended
+        if abs(validated_pred) < 1e-6 and abs(original_pred) > 1e-4:
+            validated_pred = np.sign(original_pred) * 0.001  # Minimum 0.1% prediction
+            warnings.append("ZERO: Tiny prediction increased to minimum threshold")
+        
+        # Log validation results if there were changes
+        if warnings:
+            print(f"[validate_prediction_bounds] {ticker}: {'; '.join(warnings)}")
+        
+        return float(validated_pred), warnings
+        
+    except Exception as e:
+        print(f"[validate_prediction_bounds] Error for {ticker}: {e}")
+        return float(prediction) if prediction is not None else 0.0, [f"Validation error: {e}"]
+
+def sanitize_for_json(obj):
+    """Recursively replace NaN and inf values with None for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(item) for item in obj]
+    elif isinstance(obj, (float, np.floating)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (int, np.integer)):
+        return int(obj)
+    else:
+        return obj
 
 # --- Improved Confidence Interval Calculations ---
 def calculate_proper_confidence_interval(predictions, confidence_level=95, base_volatility=0.02):
@@ -50,9 +150,22 @@ def calculate_proper_confidence_interval(predictions, confidence_level=95, base_
         pred_values = list(predictions.values())
     else:
         pred_values = predictions
+    
+    # Ensure pred_values is always iterable
+    if not hasattr(pred_values, '__len__') or isinstance(pred_values, (str, np.number)):
+        pred_values = [pred_values]
+    pred_values = ensure_iterable(pred_values)
+    
     mean_pred = np.mean(pred_values)
     model_std = np.std(pred_values) if len(pred_values) > 1 else 0
     total_uncertainty = np.sqrt(model_std**2 + base_volatility**2)
+    
+    # Handle edge cases where calculations might result in NaN
+    if np.isnan(mean_pred):
+        mean_pred = 0.0
+    if np.isnan(total_uncertainty) or total_uncertainty == 0:
+        total_uncertainty = base_volatility
+    
     if len(pred_values) < 30:
         alpha = (100 - confidence_level) / 100
         t_value = stats.t.ppf(1 - alpha/2, df=len(pred_values)-1)
@@ -61,11 +174,17 @@ def calculate_proper_confidence_interval(predictions, confidence_level=95, base_
         alpha = (100 - confidence_level) / 100
         z_value = stats.norm.ppf(1 - alpha/2)
         margin_of_error = z_value * total_uncertainty
+    
+    # Ensure margin_of_error is not NaN
+    if np.isnan(margin_of_error):
+        margin_of_error = 0.05  # Default 5% margin
+    
     lower_bound = mean_pred - margin_of_error
     upper_bound = mean_pred + margin_of_error
     return lower_bound, upper_bound
 
 def calculate_regime_adjusted_confidence(predictions, market_condition, market_strength, confidence_level=95):
+    """Calculate confidence intervals based on market regime"""
     regime_volatility = {
         'bull': 0.015,
         'bear': 0.025,
@@ -74,35 +193,134 @@ def calculate_regime_adjusted_confidence(predictions, market_condition, market_s
     }
     base_vol = regime_volatility.get(market_condition, 0.02)
     adjusted_vol = base_vol * (0.5 + market_strength)
-    return calculate_proper_confidence_interval(predictions, confidence_level, adjusted_vol)
+    
+    print(f"[calculate_regime_adjusted_confidence] Market: {market_condition}, strength: {market_strength}")
+    print(f"[calculate_regime_adjusted_confidence] Base vol: {base_vol:.6f}, adjusted vol: {adjusted_vol:.6f}")
+    
+    # Convert single prediction to proper format
+    if not hasattr(predictions, '__len__') or isinstance(predictions, (str, np.number)):
+        prediction_value = float(predictions)
+    else:
+        prediction_value = np.mean(predictions) if len(predictions) > 0 else 0.0
+    
+    # Calculate confidence interval bounds
+    alpha = (100 - confidence_level) / 100
+    z_value = stats.norm.ppf(1 - alpha/2)
+    
+    margin_of_error = z_value * adjusted_vol
+    
+    print(f"[calculate_regime_adjusted_confidence] Z-value: {z_value:.3f}, margin: {margin_of_error:.6f}")
+    
+    lower_bound = prediction_value - margin_of_error
+    upper_bound = prediction_value + margin_of_error
+    
+    return lower_bound, upper_bound
 
 def calculate_historical_confidence(df, predictions, confidence_level=95, lookback_days=252, prediction_window=5):
-    if df is None or len(df) < lookback_days:
+    """Calculate confidence intervals using historical volatility"""
+    if df is None or len(df) < 30:
+        # Fallback to basic confidence calculation
+        if not hasattr(predictions, '__len__') or isinstance(predictions, (str, np.number)):
+            predictions = [predictions]
+        predictions = ensure_iterable(predictions)
         return calculate_proper_confidence_interval(predictions, confidence_level)
+    
+    # Calculate historical volatility
     returns = df['Close'].pct_change().dropna()
-    historical_vol = returns.tail(lookback_days).std()
-    annualized_vol = historical_vol * np.sqrt(252)
-    scaled_vol = annualized_vol * np.sqrt(prediction_window / 252)
-    return calculate_proper_confidence_interval(predictions, confidence_level, scaled_vol)
-
-def ensure_iterable(obj):
-    """Ensure the object is iterable. If not, wrap it in a list."""
-    if isinstance(obj, (list, np.ndarray, pd.Series)):
-        return obj
-    return [obj]
+    if len(returns) < 30:
+        # Not enough data for meaningful volatility calculation
+        return calculate_proper_confidence_interval([predictions], confidence_level)
+    
+    # Use available data, but at least 30 days
+    lookback_data = returns.tail(min(lookback_days, len(returns)))
+    historical_vol = lookback_data.std()
+    
+    # Scale volatility to prediction window
+    scaled_vol = historical_vol * np.sqrt(prediction_window)
+    
+    print(f"[calculate_historical_confidence] Historical vol: {historical_vol:.6f}, scaled vol: {scaled_vol:.6f}")
+    
+    # Convert single prediction to proper format
+    if not hasattr(predictions, '__len__') or isinstance(predictions, (str, np.number)):
+        prediction_value = float(predictions)
+    else:
+        prediction_value = np.mean(predictions) if len(predictions) > 0 else 0.0
+    
+    # Calculate confidence interval bounds
+    alpha = (100 - confidence_level) / 100
+    z_value = stats.norm.ppf(1 - alpha/2)  # Use normal distribution for volatility-based CI
+    
+    margin_of_error = z_value * scaled_vol
+    
+    print(f"[calculate_historical_confidence] Z-value: {z_value:.3f}, margin: {margin_of_error:.6f}")
+    
+    lower_bound = prediction_value - margin_of_error
+    upper_bound = prediction_value + margin_of_error
+    
+    return lower_bound, upper_bound
 
 def fixed_single_ticker_prediction(df, model_predictions, market_condition, market_strength, confidence_level, prediction_window=5):
     """Calculate prediction and confidence intervals for a single ticker."""
-    avg_preds = [v['avg_pred'] if isinstance(v, dict) and 'avg_pred' in v else v for v in ensure_iterable(model_predictions.values()) if not isinstance(v, str)]
-    avg_pred = np.mean(avg_preds) if avg_preds else 0.0
-    if df is not None and len(df) > 50:
-        lower, upper = calculate_historical_confidence(df, avg_pred, confidence_level, prediction_window=prediction_window)
+    
+    # Handle different formats of model_predictions
+    if isinstance(model_predictions, dict):
+        # Check if it's the new structured format from train_model_for_stock
+        if 'prediction' in model_predictions and 'individual_predictions' in model_predictions:
+            # New format: use the ensemble prediction directly
+            avg_pred = model_predictions['prediction']
+            print(f"[fixed_single_ticker_prediction] Using structured format prediction: {avg_pred}")
+        else:
+            # Old format: extract predictions from dict values
+            values_list = list(model_predictions.values())
+            avg_preds = []
+            for v in values_list:
+                if isinstance(v, dict) and 'avg_pred' in v:
+                    avg_preds.append(v['avg_pred'])
+                elif isinstance(v, (int, float)):
+                    avg_preds.append(float(v))
+                elif isinstance(v, (list, np.ndarray)) and len(v) > 0:
+                    avg_preds.append(float(v[-1]) if hasattr(v[-1], '__float__') else 0.0)
+            
+            avg_preds = ensure_iterable(avg_preds)
+            avg_pred = np.mean([p for p in avg_preds if not np.isnan(p)]) if len(avg_preds) > 0 else 0.0
+            print(f"[fixed_single_ticker_prediction] Using old format, extracted predictions: {avg_preds}, average: {avg_pred}")
     else:
+        # Handle single prediction value
+        avg_pred = float(model_predictions) if model_predictions is not None else 0.0
+        print(f"[fixed_single_ticker_prediction] Using single prediction value: {avg_pred}")
+    
+    # Handle NaN in prediction
+    if np.isnan(avg_pred):
+        avg_pred = 0.0
+        print(f"[fixed_single_ticker_prediction] Prediction was NaN, set to 0.0")
+    
+    print(f"[fixed_single_ticker_prediction] Final avg_pred: {avg_pred} ({avg_pred*100:.3f}%)")
+    print(f"[fixed_single_ticker_prediction] Market condition: {market_condition}, strength: {market_strength}")
+    print(f"[fixed_single_ticker_prediction] Historical data available: {df is not None and len(df) > 50}")
+    
+    if df is not None and len(df) > 50:
+        print(f"[fixed_single_ticker_prediction] Using historical confidence calculation with {len(df)} data points")
+        lower, upper = calculate_historical_confidence(df, avg_pred, confidence_level, prediction_window=prediction_window)
+        print(f"[fixed_single_ticker_prediction] Historical confidence result: lower={lower}, upper={upper}")
+    else:
+        print(f"[fixed_single_ticker_prediction] Using regime-adjusted confidence calculation")
         lower, upper = calculate_regime_adjusted_confidence(avg_pred, market_condition, market_strength, confidence_level)
+        print(f"[fixed_single_ticker_prediction] Regime confidence result: lower={lower}, upper={upper}")
+    
+    # Ensure bounds are not NaN
+    if np.isnan(lower):
+        print(f"[fixed_single_ticker_prediction] Lower bound was NaN, using fallback: {avg_pred - 0.05}")
+        lower = avg_pred - 0.05
+    if np.isnan(upper):
+        print(f"[fixed_single_ticker_prediction] Upper bound was NaN, using fallback: {avg_pred + 0.05}")
+        upper = avg_pred + 0.05
+    
+    print(f"[fixed_single_ticker_prediction] Final confidence interval: [{lower:.6f}, {upper:.6f}] = [{lower*100:.3f}%, {upper*100:.3f}%]")
+    
     return {
-        'prediction': avg_pred,
-        'lower_bound': lower,
-        'upper_bound': upper,
+        'prediction': float(avg_pred),
+        'lower_bound': float(lower),
+        'upper_bound': float(upper),
         'confidence_level': confidence_level
     }
 
@@ -128,6 +346,61 @@ MODEL_CONFIGS = {
     9: {'name': 'Elastic Net Conformal', 'description': 'Low vol, regularized'},
     10: {'name': 'Transformer', 'description': 'Deep learning, sequence modeling'}
 }
+
+# Market symbols for cross-asset features
+MARKET_SYMBOLS = ['SPY', 'VIX', 'DXY', 'TLT', 'GLD', 'QQQ']
+market_data_cache = {}  # Global cache for market data
+CACHE_MAX_SIZE = 50  # Maximum number of cache entries to prevent memory bloat
+CACHE_MAX_AGE_HOURS = 24  # Maximum age of cache entries in hours
+
+def manage_cache_size():
+    """Manage cache size to prevent memory bloat"""
+    global market_data_cache
+    
+    if len(market_data_cache) <= CACHE_MAX_SIZE:
+        return
+    
+    print(f"[manage_cache_size] Cache size ({len(market_data_cache)}) exceeds limit ({CACHE_MAX_SIZE}), cleaning up...")
+    
+    # Remove oldest entries based on access time or creation time
+    # For simplicity, we'll clear half the cache when it gets too large
+    cache_items = list(market_data_cache.items())
+    items_to_keep = cache_items[:CACHE_MAX_SIZE // 2]
+    
+    market_data_cache = dict(items_to_keep)
+    print(f"[manage_cache_size] Cache cleaned, new size: {len(market_data_cache)}")
+
+def clear_stale_cache():
+    """Clear cache entries older than CACHE_MAX_AGE_HOURS"""
+    global market_data_cache
+    
+    try:
+        import time
+        current_time = time.time()
+        stale_keys = []
+        
+        # Check cache files for staleness
+        for cache_key in os.listdir(CACHE_DIR):
+            if cache_key.endswith('.pkl'):
+                cache_file = os.path.join(CACHE_DIR, cache_key)
+                file_age_hours = (current_time - os.path.getmtime(cache_file)) / 3600
+                
+                if file_age_hours > CACHE_MAX_AGE_HOURS:
+                    stale_keys.append(cache_key)
+        
+        # Remove stale files
+        for key in stale_keys:
+            try:
+                os.remove(os.path.join(CACHE_DIR, key))
+                print(f"[clear_stale_cache] Removed stale cache file: {key}")
+            except Exception as e:
+                print(f"[clear_stale_cache] Error removing {key}: {e}")
+        
+        if stale_keys:
+            print(f"[clear_stale_cache] Cleaned {len(stale_keys)} stale cache entries")
+            
+    except Exception as e:
+        print(f"[clear_stale_cache] Error during cache cleanup: {e}")
 
 # Index Wikipedia URLs
 INDEX_URLS = {
@@ -277,6 +550,47 @@ def scrape_index_constituents(index_name, force_refresh=False):
     except Exception as e:
         print(f"Error scraping {index_name}: {e}")
         return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+
+def download_market_data_cache(start_date, force_refresh=False):
+    """Download and cache market data for cross-asset features"""
+    global market_data_cache
+    
+    # Clean up stale cache entries before downloading new data
+    clear_stale_cache()
+    
+    cache_key = f"market_data_{start_date.replace('-', '')}"
+    
+    if not force_refresh:
+        cached_data = get_cached_data(cache_key)
+        if cached_data:
+            market_data_cache = cached_data
+            manage_cache_size()  # Ensure cache doesn't grow too large
+            return cached_data
+    
+    print("[download_market_data_cache] Downloading market reference data...")
+    market_data_cache = {}
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        def fetch_market_symbol(symbol):
+            try:
+                df = yf.download(symbol, start=start_date, progress=False)
+                if df is not None and not df.empty and len(df) >= 50:
+                    return symbol, df
+            except Exception as e:
+                print(f"[download_market_data_cache] Error downloading {symbol}: {e}")
+            return symbol, None
+        
+        futures = {executor.submit(fetch_market_symbol, symbol): symbol for symbol in MARKET_SYMBOLS}
+        for future in as_completed(futures):
+            symbol, data = future.result()
+            if data is not None:
+                market_data_cache[symbol] = data
+    
+    # Save to cache and manage cache size
+    save_to_cache(cache_key, market_data_cache)
+    manage_cache_size()  # Ensure cache doesn't grow too large
+    print(f"[download_market_data_cache] Successfully cached {len(market_data_cache)} market symbols")
+    return market_data_cache
 
 def download_index_data(index_name, start_date, force_refresh=False):
     # Always force refresh for debugging
@@ -486,14 +800,19 @@ def detect_market_regime(etf_df):
 
 def calc_slope(x):
     """Calculate slope of a series"""
+    # Ensure x is iterable and has length
+    if not hasattr(x, '__len__') or isinstance(x, (str, np.number)):
+        x = [x]
+    x = ensure_iterable(x)
+    
     if len(x) < 2:
         return np.nan
     return np.polyfit(range(len(x)), x, 1)[0]
 
-def add_features_to_stock(ticker, df, prediction_window=5):
-    """Add features to a single stock's data, with N-day lookahead and 30 total indicators (5 per group)."""
+def add_features_to_stock_original(ticker, df, prediction_window=5):
+    """Original feature engineering function (backup)"""
     if df is None or len(df) < 50:
-        print(f"[add_features_to_stock] {ticker}: DataFrame is None or too short ({len(df) if df is not None else 0} rows)")
+        print(f"[add_features_to_stock_original] {ticker}: DataFrame is None or too short ({len(df) if df is not None else 0} rows)")
         return None
     try:
         df = df.copy()
@@ -501,11 +820,27 @@ def add_features_to_stock(ticker, df, prediction_window=5):
         try:
             for col in ['Close', 'High', 'Low', 'Volume']:
                 if col not in df.columns:
-                    print(f"[add_features_to_stock] {ticker}: Missing required column {col}")
+                    print(f"[add_features_to_stock_original] {ticker}: Missing required column {col}")
                     return None
-                df[f'{col.lower()}_series'] = pd.to_numeric(df[col], errors='coerce')
+                
+                # Handle potential MultiIndex columns or Series data
+                series_data = df[col]
+                if hasattr(series_data, 'values'):
+                    series_data = series_data.values
+                
+                # Flatten the series if it's nested
+                if isinstance(series_data, (list, tuple)):
+                    series_data = np.array(series_data).flatten()
+                elif hasattr(series_data, 'flatten'):
+                    series_data = series_data.flatten()
+                
+                # Convert to numeric Series
+                df[f'{col.lower()}_series'] = pd.Series(
+                    pd.to_numeric(series_data, errors='coerce'), 
+                    index=df.index
+                )
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error converting price data: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error converting price data: {e}")
             return None
 
         # Initialize features list to track successful calculations
@@ -515,27 +850,32 @@ def add_features_to_stock(ticker, df, prediction_window=5):
         try:
             rsi = RSIIndicator(close=df['close_series'])
             df['RSI'] = pd.Series(rsi.rsi(), index=df.index)
-            calculated_features.append('RSI')
+            if 'RSI' in df.columns and not df['RSI'].isna().all():
+                calculated_features.append('RSI')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating RSI: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating RSI: {e}")
 
         try:
             df['roc_10'] = flatten_series(ROCIndicator(close=df['close_series']).roc())
-            calculated_features.append('roc_10')
+            if 'roc_10' in df.columns and not df['roc_10'].isna().all():
+                calculated_features.append('roc_10')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating ROC: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating ROC: {e}")
 
         try:
             df['momentum'] = flatten_series(df['close_series'] - df['close_series'].shift(10))
-            calculated_features.append('momentum')
+            if 'momentum' in df.columns and not df['momentum'].isna().all():
+                calculated_features.append('momentum')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating momentum: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating momentum: {e}")
 
         try:
-            df['rsi_14_diff'] = flatten_series(df['RSI'] - df['RSI'].shift(5))
-            calculated_features.append('rsi_14_diff')
+            if 'RSI' in df.columns:
+                df['rsi_14_diff'] = flatten_series(df['RSI'] - df['RSI'].shift(5))
+                if 'rsi_14_diff' in df.columns and not df['rsi_14_diff'].isna().all():
+                    calculated_features.append('rsi_14_diff')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating RSI difference: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating RSI difference: {e}")
 
         # --- Trend ---
         try:
@@ -545,27 +885,27 @@ def add_features_to_stock(ticker, df, prediction_window=5):
             df['ema_diff'] = flatten_series((df['macd'] - df['macd_signal']).squeeze())
             calculated_features.extend(['macd', 'macd_signal', 'ema_diff'])
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating MACD: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating MACD: {e}")
 
         try:
             df['slope_price_10d'] = flatten_series(df['close_series'].rolling(window=10).apply(calc_slope, raw=False))
             calculated_features.append('slope_price_10d')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating slope of price: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating slope of price: {e}")
 
         try:
             ema_10 = flatten_series(EMAIndicator(close=df['close_series'], window=10).ema_indicator())
             df['ema_ratio'] = flatten_series(df['close_series'] / ema_10)
             calculated_features.append('ema_ratio')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating EMA ratio: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating EMA ratio: {e}")
 
         try:
             for col in ['macd', 'macd_signal', 'ema_diff']:
                 series = df[col]
                 df[col] = flatten_series((series - series.mean()) / (series.std() if series.std() != 0 else 1))
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error normalizing MACD features: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error normalizing MACD features: {e}")
 
         # --- Momentum ---
         try:
@@ -577,52 +917,52 @@ def add_features_to_stock(ticker, df, prediction_window=5):
                 df['stoch_k'] = flatten_series(50)  # fallback if constant
             calculated_features.append('stoch_k')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating Stochastic Oscillator: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating Stochastic Oscillator: {e}")
 
         # --- Volatility ---
         try:
             df['ATR'] = flatten_series(AverageTrueRange(high=df['high_series'], low=df['low_series'], close=df['close_series']).average_true_range())
             calculated_features.append('ATR')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating ATR: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating ATR: {e}")
 
         try:
             df['volatility'] = flatten_series(np.log(df['close_series'] / df['close_series'].shift(1)).rolling(10).std())
             calculated_features.append('volatility')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating volatility: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating volatility: {e}")
 
         try:
             df['rolling_20d_std'] = flatten_series(df['close_series'].rolling(window=20).std())
             calculated_features.append('rolling_20d_std')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating rolling standard deviation: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating rolling standard deviation: {e}")
 
         try:
             bb = BollingerBands(close=df['close_series'])
             df['bb_width'] = flatten_series(bb.bollinger_wband())
             calculated_features.append('bb_width')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating Bollinger Band width: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating Bollinger Band width: {e}")
 
         try:
             df['donchian_width'] = flatten_series(df['high_series'].rolling(window=20).max() - df['low_series'].rolling(window=20).min())
             calculated_features.append('donchian_width')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating Donchian width: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating Donchian width: {e}")
 
         # --- Volume ---
         try:
             df['OBV'] = flatten_series(OnBalanceVolumeIndicator(close=df['close_series'], volume=df['volume_series']).on_balance_volume())
             calculated_features.append('OBV')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating OBV: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating OBV: {e}")
 
         try:
             df['volume_pct_change'] = flatten_series(df['Volume'].pct_change())
             calculated_features.append('volume_pct_change')
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating volume percentage change: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating volume percentage change: {e}")
 
         # --- Other/Composite ---
         try:
@@ -635,7 +975,7 @@ def add_features_to_stock(ticker, df, prediction_window=5):
             df[f'rolling_min_{prediction_window}'] = flatten_series(df['Close'].rolling(window=prediction_window).min())
             calculated_features.extend(['close_lag_1', 'close_lag_5', 'past_10d_return', f'close_lead_{prediction_window}', f'forward_return_{prediction_window}', f'rolling_max_{prediction_window}', f'rolling_min_{prediction_window}'])
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating composite features: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating composite features: {e}")
 
         try:
             ichimoku = IchimokuIndicator(high=df['high_series'], low=df['low_series'], window1=9, window2=26, window3=52, fillna=True)
@@ -644,32 +984,257 @@ def add_features_to_stock(ticker, df, prediction_window=5):
             df['ichimoku_base'] = flatten_series(ichimoku.ichimoku_base_line())
             calculated_features.extend(['ichimoku_a', 'ichimoku_b', 'ichimoku_base'])
         except Exception as e:
-            print(f"[add_features_to_stock] {ticker}: Error calculating Ichimoku features: {e}")
+            print(f"[add_features_to_stock_original] {ticker}: Error calculating Ichimoku features: {e}")
 
         # Drop rows with NaN for rolling features, but NOT for close_lead_N, forward_return_N, rolling_max/min
-        feature_cols = calculated_features
+        # Only include columns that actually exist in the DataFrame
+        existing_feature_cols = [col for col in calculated_features if col in df.columns]
 
-        # Add lagged features for selected indicators
+        # Add lagged features for selected indicators (only if they exist)
         lag_features = ['RSI', 'macd', 'stoch_k', 'ATR', 'rolling_20d_std', 'percent_b', 'OBV', 'cmf']
         num_lags = 3
         for feat in lag_features:
             for lag in range(1, num_lags+1):
                 col_name = f'{feat}_lag{lag}'
                 if col_name in df.columns:
-                    feature_cols.append(col_name)
-        df = df.dropna(subset=feature_cols)
+                    existing_feature_cols.append(col_name)
+        
+        if existing_feature_cols:
+            df = df.dropna(subset=existing_feature_cols)
+        else:
+            print(f"[add_features_to_stock_original] {ticker}: No valid features calculated")
+            return None
+            
         return df
     except Exception as e:
-        print(f"[add_features_to_stock] ERROR for {ticker}: {e}")
+        print(f"[add_features_to_stock_original] ERROR for {ticker}: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-def add_features_parallel(stock_data, prediction_window=5):
+def add_features_to_stock(ticker, df, prediction_window=5, market_data_cache=None):
+    """Enhanced version with cross-asset features"""
+    if df is None or len(df) < 50:
+        print(f"[add_features_to_stock] {ticker}: DataFrame too short or None")
+        return None
+    
+    try:
+        # Start with existing technical features
+        df = add_features_to_stock_original(ticker, df, prediction_window)
+        if df is None:
+            return None
+        
+        # Add cross-asset features if market data is available
+        if market_data_cache:
+            if not isinstance(market_data_cache, dict) or len(market_data_cache) == 0:
+                print(f"[add_features_to_stock] {ticker}: Market data cache is empty or invalid, skipping cross-asset features")
+            else:
+                print(f"[add_features_to_stock] {ticker}: Adding cross-asset features using {len(market_data_cache)} market symbols")
+                try:
+                    df = add_cross_asset_features(df, ticker, market_data_cache)
+                except Exception as e:
+                    print(f"[add_features_to_stock] {ticker}: Error adding cross-asset features: {e}")
+                    # Continue without cross-asset features rather than failing completely
+        else:
+            print(f"[add_features_to_stock] {ticker}: No market data cache provided, using technical features only")
+        
+        return df
+        
+    except Exception as e:
+        print(f"[add_features_to_stock] ERROR for {ticker}: {e}")
+        return None
+
+def add_cross_asset_features(df, ticker, market_data_cache):
+    """Add cross-asset correlation and macro features"""
+    try:
+        calculated_features = []
+        
+        # Validate market data cache
+        if not market_data_cache or not isinstance(market_data_cache, dict):
+            print(f"[add_cross_asset_features] {ticker}: Invalid market data cache")
+            return df
+        
+        available_symbols = list(market_data_cache.keys())
+        print(f"[add_cross_asset_features] {ticker}: Available market symbols: {available_symbols}")
+        
+        # Market Relative Performance (SPY correlation)
+        if 'SPY' in market_data_cache:
+            try:
+                # Limit forward fill to 5 days to prevent stale data propagation
+                spy_data = market_data_cache['SPY']['Close'].reindex(df.index, method='ffill', limit=5)
+                if len(spy_data.dropna()) > 20:
+                    spy_returns = spy_data.pct_change()
+                    stock_returns = df['Close'].pct_change()
+                    
+                    # Relative strength vs market
+                    df['relative_strength'] = flatten_series(stock_returns - spy_returns)
+                    
+                    # Rolling correlation with market
+                    df['correlation_spy_20'] = flatten_series(
+                        stock_returns.rolling(20).corr(spy_returns)
+                    )
+                    
+                    # Beta calculation (20-day rolling)
+                    df['beta_spy_20'] = flatten_series(
+                        stock_returns.rolling(20).cov(spy_returns) / spy_returns.rolling(20).var()
+                    )
+                    
+                    # Relative performance vs SPY (price ratio)
+                    df['spy_ratio'] = flatten_series(df['Close'] / spy_data)
+                    df['spy_ratio_ma'] = flatten_series(df['spy_ratio'].rolling(20).mean())
+                    
+                    calculated_features.extend([
+                        'relative_strength', 'correlation_spy_20', 'beta_spy_20', 
+                        'spy_ratio', 'spy_ratio_ma'
+                    ])
+            except Exception as e:
+                print(f"[add_cross_asset_features] {ticker}: Error calculating SPY features: {e}")
+        
+        # VIX Features (Fear Index)
+        if 'VIX' in market_data_cache:
+            # Limit forward fill to 3 days for VIX (fear index should be current)
+            vix_data = market_data_cache['VIX']['Close'].reindex(df.index, method='ffill', limit=3)
+            if len(vix_data.dropna()) > 20:
+                df['vix_level'] = flatten_series(vix_data)
+                df['vix_change'] = flatten_series(vix_data.pct_change())
+                df['vix_vs_ma'] = flatten_series(vix_data / vix_data.rolling(20).mean())
+                
+                # VIX regime indicators
+                df['vix_high'] = flatten_series((vix_data > 25).astype(int))  # High fear
+                df['vix_low'] = flatten_series((vix_data < 15).astype(int))   # Low fear
+                
+                calculated_features.extend([
+                    'vix_level', 'vix_change', 'vix_vs_ma', 'vix_high', 'vix_low'
+                ])
+        
+        # Dollar Index (DXY) Features
+        if 'DXY' in market_data_cache:
+            # Limit forward fill to 7 days for DXY (currency moves slower)
+            dxy_data = market_data_cache['DXY']['Close'].reindex(df.index, method='ffill', limit=7)
+            if len(dxy_data.dropna()) > 20:
+                dxy_returns = dxy_data.pct_change()
+                stock_returns = df['Close'].pct_change()
+                
+                df['dxy_correlation'] = flatten_series(
+                    stock_returns.rolling(20).corr(dxy_returns)
+                )
+                df['dxy_level'] = flatten_series(dxy_data)
+                df['dxy_strength'] = flatten_series(
+                    (dxy_data > dxy_data.rolling(50).mean()).astype(int)
+                )
+                
+                calculated_features.extend(['dxy_correlation', 'dxy_level', 'dxy_strength'])
+        
+        # Treasury Bonds (TLT) - Interest Rate Proxy
+        if 'TLT' in market_data_cache:
+            # Limit forward fill to 5 days for bonds
+            tlt_data = market_data_cache['TLT']['Close'].reindex(df.index, method='ffill', limit=5)
+            if len(tlt_data.dropna()) > 20:
+                tlt_returns = tlt_data.pct_change()
+                stock_returns = df['Close'].pct_change()
+                
+                df['tlt_correlation'] = flatten_series(
+                    stock_returns.rolling(20).corr(tlt_returns)
+                )
+                df['tlt_trend'] = flatten_series(
+                    (tlt_data > tlt_data.rolling(20).mean()).astype(int)
+                )
+                
+                calculated_features.extend(['tlt_correlation', 'tlt_trend'])
+        
+        # Gold (GLD) - Risk-off Asset
+        if 'GLD' in market_data_cache:
+            # Limit forward fill to 5 days for gold
+            gld_data = market_data_cache['GLD']['Close'].reindex(df.index, method='ffill', limit=5)
+            if len(gld_data.dropna()) > 20:
+                gld_returns = gld_data.pct_change()
+                stock_returns = df['Close'].pct_change()
+                
+                df['gld_correlation'] = flatten_series(
+                    stock_returns.rolling(20).corr(gld_returns)
+                )
+                
+                calculated_features.append('gld_correlation')
+        
+        # Tech vs Market (QQQ vs SPY)
+        if 'QQQ' in market_data_cache and 'SPY' in market_data_cache:
+            # Limit forward fill to 5 days for both tech and market indices
+            qqq_data = market_data_cache['QQQ']['Close'].reindex(df.index, method='ffill', limit=5)
+            spy_data = market_data_cache['SPY']['Close'].reindex(df.index, method='ffill', limit=5)
+            
+            if len(qqq_data.dropna()) > 20 and len(spy_data.dropna()) > 20:
+                df['qqq_spy_ratio'] = flatten_series(qqq_data / spy_data)
+                df['tech_outperform'] = flatten_series(
+                    (df['qqq_spy_ratio'] > df['qqq_spy_ratio'].rolling(20).mean()).astype(int)
+                )
+                
+                calculated_features.extend(['qqq_spy_ratio', 'tech_outperform'])
+        
+        # Enhanced Time-Based Features
+        df['day_of_week'] = df.index.dayofweek
+        df['month'] = df.index.month
+        df['quarter'] = df.index.quarter
+        df['is_month_end'] = (df.index == df.index.to_period('M').end_time).astype(int)
+        df['is_quarter_end'] = (df.index == df.index.to_period('Q').end_time).astype(int)
+        df['is_friday'] = (df.index.dayofweek == 4).astype(int)
+        df['is_monday'] = (df.index.dayofweek == 0).astype(int)
+        
+        calculated_features.extend([
+            'day_of_week', 'month', 'quarter', 'is_month_end', 
+            'is_quarter_end', 'is_friday', 'is_monday'
+        ])
+        
+        # Market Regime Features (based on multiple assets)
+        regime_features = calculate_market_regime_features(market_data_cache, df.index)
+        for feature_name, feature_values in regime_features.items():
+            df[feature_name] = flatten_series(feature_values)
+            calculated_features.append(feature_name)
+        
+        print(f"[add_cross_asset_features] {ticker}: Added {len(calculated_features)} cross-asset features")
+        return df
+        
+    except Exception as e:
+        print(f"[add_cross_asset_features] Error for {ticker}: {e}")
+        return df
+
+def calculate_market_regime_features(market_data_cache, target_index):
+    """Calculate regime features based on multiple market indicators"""
+    regime_features = {}
+    
+    try:
+        # Multi-asset trend strength
+        if 'SPY' in market_data_cache and 'VIX' in market_data_cache:
+            # Limit forward fill to prevent stale regime data
+            spy_data = market_data_cache['SPY']['Close'].reindex(target_index, method='ffill', limit=5)
+            vix_data = market_data_cache['VIX']['Close'].reindex(target_index, method='ffill', limit=3)
+            
+            # Risk-on/Risk-off regime
+            spy_trend = (spy_data > spy_data.rolling(20).mean()).astype(int)
+            vix_trend = (vix_data < vix_data.rolling(20).mean()).astype(int)
+            
+            regime_features['risk_on'] = spy_trend & vix_trend  # SPY up, VIX down
+            regime_features['risk_off'] = (~spy_trend) & (~vix_trend)  # SPY down, VIX up
+        
+        # Interest rate environment
+        if 'TLT' in market_data_cache:
+            tlt_data = market_data_cache['TLT']['Close'].reindex(target_index, method='ffill', limit=5)
+            regime_features['rising_rates'] = (tlt_data < tlt_data.rolling(50).mean()).astype(int)
+        
+        # Dollar strength regime
+        if 'DXY' in market_data_cache:
+            dxy_data = market_data_cache['DXY']['Close'].reindex(target_index, method='ffill', limit=7)
+            regime_features['strong_dollar'] = (dxy_data > dxy_data.rolling(50).mean()).astype(int)
+        
+    except Exception as e:
+        print(f"[calculate_market_regime_features] Error: {e}")
+    
+    return regime_features
+
+def add_features_parallel(stock_data, prediction_window=5, market_data_cache=None):
     """Add features to all stocks using parallel processing, with N-day lookahead."""
     with ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
         future_to_ticker = {
-            executor.submit(add_features_to_stock, ticker, df, prediction_window): ticker 
+            executor.submit(add_features_to_stock, ticker, df, prediction_window, market_data_cache): ticker 
             for ticker, df in stock_data.items()
         }
         processed_data = {}
@@ -685,14 +1250,14 @@ def add_features_parallel(stock_data, prediction_window=5):
 
 def get_indicator_weights(regime, regime_strength):
     """Return a dict of feature weights based on regime and regime strength."""
-    # Define base weights for each group per regime
+    # Define base weights for each group per regime - updated with cross_asset group
     base_weights = {
-        'bull': {'momentum': 1.3, 'trend': 1.2, 'mean_reversion': 0.8, 'volatility': 0.7, 'volume': 1.0, 'other': 1.0},
-        'bear': {'momentum': 0.8, 'trend': 0.7, 'mean_reversion': 1.3, 'volatility': 1.2, 'volume': 1.0, 'other': 1.0},
-        'sideways': {'momentum': 0.8, 'trend': 0.8, 'mean_reversion': 1.3, 'volatility': 1.0, 'volume': 1.0, 'other': 1.0},
-        'volatile': {'momentum': 0.7, 'trend': 0.7, 'mean_reversion': 1.1, 'volatility': 1.3, 'volume': 1.2, 'other': 1.0},
+        'bull': {'momentum': 1.3, 'trend': 1.2, 'mean_reversion': 0.8, 'volatility': 0.7, 'volume': 1.0, 'cross_asset': 1.1, 'other': 1.0},
+        'bear': {'momentum': 0.8, 'trend': 0.7, 'mean_reversion': 1.3, 'volatility': 1.2, 'volume': 1.0, 'cross_asset': 1.2, 'other': 1.0},
+        'sideways': {'momentum': 0.8, 'trend': 0.8, 'mean_reversion': 1.3, 'volatility': 1.0, 'volume': 1.0, 'cross_asset': 0.9, 'other': 1.0},
+        'volatile': {'momentum': 0.7, 'trend': 0.7, 'mean_reversion': 1.1, 'volatility': 1.3, 'volume': 1.2, 'cross_asset': 1.3, 'other': 1.0},
     }
-    # Map each feature to a group
+    # Map each feature to a group - updated with cross-asset features
     group_map = {
         # Momentum
         'RSI': 'momentum', 'roc_10': 'momentum', 'momentum': 'momentum', 'rsi_14_diff': 'momentum', 'williams_r': 'momentum', 'stoch_k': 'momentum',
@@ -706,6 +1271,23 @@ def get_indicator_weights(regime, regime_strength):
         'OBV': 'volume', 'volume_pct_change': 'volume', 'cmf': 'volume', 'adl': 'volume', 'ichimoku_a': 'other', 'ichimoku_b': 'other', 'ichimoku_base': 'other',
         # Other/Composite
         'close_lag_1': 'other', 'close_lag_5': 'other', 'past_10d_return': 'other',
+        
+        # NEW: Cross-asset features
+        'relative_strength': 'cross_asset', 'correlation_spy_20': 'cross_asset', 
+        'beta_spy_20': 'cross_asset', 'spy_ratio': 'cross_asset', 'spy_ratio_ma': 'cross_asset',
+        'vix_level': 'cross_asset', 'vix_change': 'cross_asset', 'vix_vs_ma': 'cross_asset',
+        'vix_high': 'cross_asset', 'vix_low': 'cross_asset',
+        'dxy_correlation': 'cross_asset', 'dxy_level': 'cross_asset', 'dxy_strength': 'cross_asset',
+        'tlt_correlation': 'cross_asset', 'tlt_trend': 'cross_asset',
+        'gld_correlation': 'cross_asset',
+        'qqq_spy_ratio': 'cross_asset', 'tech_outperform': 'cross_asset',
+        'risk_on': 'cross_asset', 'risk_off': 'cross_asset', 
+        'rising_rates': 'cross_asset', 'strong_dollar': 'cross_asset',
+        
+        # Enhanced time features
+        'day_of_week': 'other', 'month': 'other', 'quarter': 'other', 
+        'is_month_end': 'other', 'is_quarter_end': 'other', 
+        'is_friday': 'other', 'is_monday': 'other'
     }
     # Add lagged features to group_map
     lag_features = {
@@ -727,71 +1309,191 @@ def get_indicator_weights(regime, regime_strength):
 def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.5):
     """Train models for a single stock, with regime-aware feature weighting."""
     if df is None or len(df) < 50:
+        print(f"[train_model_for_stock] {ticker}: DataFrame too short or None")
         return None
+    
     try:
-        feature_columns = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume']]
-        # Forcibly flatten all feature columns to 1D, then handle object dtype
+        # Extract feature columns (exclude basic OHLCV)
+        feature_columns = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']]
+        
+        # Validate that we have meaningful features
+        cross_asset_features = [col for col in feature_columns if any(keyword in col for keyword in 
+                               ['spy', 'vix', 'dxy', 'tlt', 'gld', 'qqq', 'relative_strength', 'correlation', 'beta', 'risk_on', 'risk_off'])]
+        technical_features = [col for col in feature_columns if col not in cross_asset_features]
+        
+        print(f"[train_model_for_stock] {ticker}: Technical features: {len(technical_features)}, Cross-asset features: {len(cross_asset_features)}")
+        
+        if len(technical_features) < 5:
+            print(f"[train_model_for_stock] {ticker}: Insufficient technical features ({len(technical_features)})")
+            return None
+        
+        # Clean and prepare features
+        df_clean = df.copy()
         for col in feature_columns:
-            df[col] = np.asarray(df[col]).reshape(-1)
-            if df[col].dtype == 'O':
-                df[col] = df[col].apply(lambda x: x[0] if isinstance(x, (np.ndarray, list)) and len(x) == 1 else (x if np.isscalar(x) else float(np.asarray(x).flatten()[0])))
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        X = df[feature_columns].values.astype(float)
-        # Prepare targets for N, N+1, N+2 day lookahead
-        y_N = df['Close'].pct_change().shift(-1).values  # N=1 day
-        y_N1 = df['Close'].pct_change(periods=2).shift(-2).values  # N+1=2 days
-        y_N2 = df['Close'].pct_change(periods=3).shift(-3).values  # N+2=3 days
-        preds_dict = {}
-        for model_id in model_ids:
-            preds = []
-            for y_target in [y_N, y_N1, y_N2]:
-                valid_indices = ~(np.isnan(X).any(axis=1) | np.isnan(y_target))
-                X_valid = X[valid_indices]
-                y_valid = y_target[valid_indices]
-                if len(X_valid) < 20:
-                    preds.append(0.0)
-                    continue
-                pred = train_and_predict_model(X_valid, y_valid, model_id)
-                preds.append(pred[-1])
-            avg_pred = float(np.mean(preds))
-            preds_dict[model_id] = {
-                'avg_pred': avg_pred,
-                'all_preds': preds
-            }
-        return preds_dict
+            if col in df_clean.columns:
+                # Handle any nested arrays or objects
+                series = df_clean[col]
+                if series.dtype == 'object':
+                    series = series.apply(lambda x: x[0] if isinstance(x, (np.ndarray, list)) and len(x) > 0 else x)
+                df_clean[col] = pd.to_numeric(series, errors='coerce')
+        
+        # Remove columns that are all NaN and validate feature quality
+        valid_features = []
+        failed_features = []
+        for col in feature_columns:
+            if col in df_clean.columns:
+                if df_clean[col].isna().all():
+                    failed_features.append(col)
+                elif df_clean[col].var() == 0:  # No variance (constant values)
+                    failed_features.append(f"{col} (constant)")
+                else:
+                    valid_features.append(col)
+            else:
+                failed_features.append(f"{col} (missing)")
+        
+        # Report feature validation results
+        if failed_features:
+            print(f"[train_model_for_stock] {ticker}: Failed features ({len(failed_features)}): {failed_features[:10]}{'...' if len(failed_features) > 10 else ''}")
+        
+        # Categorize valid features for better reporting
+        valid_technical = [col for col in valid_features if col in technical_features]
+        valid_cross_asset = [col for col in valid_features if col in cross_asset_features]
+        
+        print(f"[train_model_for_stock] {ticker}: Valid features - Technical: {len(valid_technical)}, Cross-asset: {len(valid_cross_asset)}")
+        
+        if len(valid_features) < 5:
+            print(f"[train_model_for_stock] {ticker}: Not enough valid features ({len(valid_features)})")
+            return None
+        
+        # Prepare feature matrix
+        X = df_clean[valid_features].values.astype(float)
+        
+        # Apply regime-based feature weights if provided
         if regime is not None:
             weights_dict = get_indicator_weights(regime, regime_strength)
-            weights = [weights_dict.get(f, 1.0) for f in feature_columns]
+            weights = np.array([weights_dict.get(col, 1.0) for col in valid_features])
             X = X * weights
+        
+        # Prepare target: future returns
+        # Use simple 1-day forward return as primary target
+        future_returns = df_clean['Close'].pct_change().shift(-1).values
+        
+        # DO NOT scale - keep returns in their natural scale for accuracy
+        # Small returns (0.001 = 0.1%) are normal and should be preserved
+        
+        # Remove rows with NaN in features or target
+        valid_mask = ~(np.isnan(X).any(axis=1) | np.isnan(future_returns))
+        X_clean = X[valid_mask]
+        y_clean = future_returns[valid_mask]
+        
+        if len(X_clean) < 30:
+            print(f"[train_model_for_stock] {ticker}: Not enough clean data ({len(X_clean)} rows)")
+            return None
+        
+        # Print some debugging info about target distribution
+        y_std = np.std(y_clean)
+        y_mean = np.mean(y_clean)
+        print(f"[train_model_for_stock] {ticker}: Target stats - Mean: {y_mean:.6f} ({y_mean*100:.3f}%), Std: {y_std:.6f} ({y_std*100:.3f}%)")
+        
+        # Train models and get predictions
         model_predictions = {}
-        # Rolling predictions for multiple windows
-        rolling_windows = [1, 2, 3, 5]
-        rolling_preds = {}
-        for win in rolling_windows:
-            # Prepare target for each window
-            y_win = df['Close'].pct_change(periods=win).shift(-win).values
-            valid_indices_win = ~(np.isnan(X).any(axis=1) | np.isnan(y_win))
-            X_win = X[valid_indices_win]
-            y_win = y_win[valid_indices_win]
-            if len(X_win) < 20:
-                rolling_preds[win] = None
-                continue
-            preds_win = {}
-            for model_id in model_ids:
-                preds_win[model_id] = train_and_predict_model(X_win, y_win, model_id)
-            rolling_preds[win] = preds_win
-        # Standard prediction for requested window: predict for last 3 days (N, N+1, N+2)
         for model_id in model_ids:
-            preds = train_and_predict_model(X, y_N, model_id)
-            avg_pred = float(np.mean(preds)) if len(preds) > 0 else 0.0
-            model_predictions[model_id] = {
-                'avg_pred': avg_pred,
-                'all_preds': preds
+            try:
+                pred_result = train_and_predict_model(X_clean, y_clean, model_id)
+                if pred_result is not None and len(pred_result) > 0:
+                    # Get the last prediction (most recent)
+                    if isinstance(pred_result, list):
+                        raw_pred = float(pred_result[-1]) if len(pred_result) > 0 else 0.0
+                    else:
+                        raw_pred = float(pred_result)
+                    
+                    # NO SCALING - keep predictions in natural decimal scale
+                    avg_pred = raw_pred
+                    
+                    # Conservative clamping to reasonable range (±20% max)
+                    avg_pred = np.clip(avg_pred, -0.20, 0.20)
+                    
+                    model_predictions[model_id] = {
+                        'avg_pred': avg_pred,
+                        'all_preds': pred_result if isinstance(pred_result, list) else [avg_pred]
+                    }
+                    
+                    print(f"[train_model_for_stock] {ticker}: Model {model_id} prediction: {avg_pred:.6f} ({avg_pred*100:.3f}%)")
+                else:
+                    print(f"[train_model_for_stock] {ticker}: Model {model_id} returned None")
+                    model_predictions[model_id] = {'avg_pred': 0.0, 'all_preds': [0.0]}
+                    
+            except Exception as e:
+                print(f"[train_model_for_stock] {ticker}: Error with model {model_id}: {e}")
+                model_predictions[model_id] = {'avg_pred': 0.0, 'all_preds': [0.0]}
+        
+        # Calculate ensemble prediction with confidence scoring
+        if model_predictions:
+            valid_predictions = [pred['avg_pred'] for pred in model_predictions.values() if abs(pred['avg_pred']) > 1e-6]
+            
+            if valid_predictions:
+                # Use median for robustness against outliers
+                ensemble_pred = np.median(valid_predictions)
+                
+                # Calculate prediction spread as confidence metric
+                pred_std = np.std(valid_predictions) if len(valid_predictions) > 1 else 0.0
+                pred_spread = np.max(valid_predictions) - np.min(valid_predictions) if len(valid_predictions) > 1 else 0.0
+                
+                # Conservative confidence scoring (lower confidence = more conservative prediction)
+                confidence = max(0.1, 1.0 - (pred_spread * 10))  # High spread = low confidence
+                
+                # Apply confidence damping to reduce overconfident predictions
+                ensemble_pred = ensemble_pred * confidence
+                
+                # Apply prediction bounds validation
+                validated_pred, validation_warnings = validate_prediction_bounds(
+                    ensemble_pred, ticker, df, strict_mode=True
+                )
+                
+                print(f"[train_model_for_stock] {ticker}: Raw ensemble: {ensemble_pred:.6f} ({ensemble_pred*100:.3f}%)")
+                print(f"[train_model_for_stock] {ticker}: Validated: {validated_pred:.6f} ({validated_pred*100:.3f}%)")
+                print(f"[train_model_for_stock] {ticker}: Confidence: {confidence:.3f}, Spread: {pred_spread:.6f}")
+                if validation_warnings:
+                    print(f"[train_model_for_stock] {ticker}: Validation warnings: {len(validation_warnings)}")
+                
+                return {
+                    'prediction': float(validated_pred),
+                    'percentage': float(validated_pred * 100),
+                    'confidence': float(confidence),
+                    'individual_predictions': {k: v['avg_pred'] for k, v in model_predictions.items()},
+                    'valid_models': len(valid_predictions),
+                    'total_models': len(model_predictions),
+                    'validation_applied': len(validation_warnings) > 0,
+                    'validation_warnings': validation_warnings
+                }
+            else:
+                print(f"[train_model_for_stock] {ticker}: No valid predictions found")
+                return {
+                    'prediction': 0.0,
+                    'percentage': 0.0,
+                    'confidence': 0.0,
+                    'individual_predictions': {k: v['avg_pred'] for k, v in model_predictions.items()},
+                    'valid_models': 0,
+                    'total_models': len(model_predictions)
+                }
+        else:
+            print(f"[train_model_for_stock] {ticker}: No model predictions generated")
+            return {
+                'prediction': 0.0,
+                'percentage': 0.0,
+                'confidence': 0.0,
+                'individual_predictions': {},
+                'valid_models': 0,
+                'total_models': 0
             }
-        model_predictions['rolling_windows'] = rolling_preds
+        
+        print(f"[train_model_for_stock] {ticker}: Completed with {len(model_predictions)} models, features: {len(valid_features)}, samples: {len(X_clean)}")
         return model_predictions
+        
     except Exception as e:
-        print(f"Error training models for {ticker}: {e}")
+        print(f"[train_model_for_stock] ERROR for {ticker}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 class TransformerModel:
@@ -832,116 +1534,236 @@ def ensure_list(pred):
 
 def train_and_predict_model(X, y, model_id):
     """Train actual ML model and make prediction, with feature scaling."""
-    def _predict_last_n(X, model, scaler, n=1):
-        # Predict for the last n rows
-        if n > len(X):
-            n = len(X)
-        X_predict = X[-n:]
-        X_predict_scaled = scaler.transform(X_predict)
-        preds = model.predict(X_predict_scaled)
-        return preds
-
     if len(X) < 50:
-        return [0.0] * 3
+        print(f"[train_and_predict_model] Not enough data for model {model_id}: {len(X)} samples")
+        return [0.0]
+    
     try:
         X = np.array(X)
         y = np.array(y)
+        
+        # Remove any remaining NaN values
         valid_mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
         X = X[valid_mask]
         y = y[valid_mask]
+        
         if len(X) < 20:
-            return [0.0] * 3
-        X_train = X[:-3] if len(X) > 3 else X[:-1]
-        y_train = y[:-3] if len(y) > 3 else y[:-1]
-        # For prediction, use last 3 rows
-        # Choose scaler
-        if model_id in [3, 6, 7, 9, 10]:
+            print(f"[train_and_predict_model] Not enough clean data for model {model_id}: {len(X)} samples")
+            return [0.0]
+        
+        # Split data: use 80% for training, 20% for out-of-sample prediction
+        split_idx = int(len(X) * 0.8)
+        X_train = X[:split_idx]
+        y_train = y[:split_idx]
+        X_test = X[split_idx:]
+        y_test = y[split_idx:]
+        
+        if len(X_train) < 10:
+            print(f"[train_and_predict_model] Not enough training data for model {model_id}: {len(X_train)} samples")
+            return [0.0]
+        
+        # Add some regularization by removing extreme outliers in target
+        y_train_q25 = np.percentile(y_train, 25)
+        y_train_q75 = np.percentile(y_train, 75)
+        iqr = y_train_q75 - y_train_q25
+        outlier_threshold = 3.0 * iqr
+        
+        outlier_mask = (y_train >= y_train_q25 - outlier_threshold) & (y_train <= y_train_q75 + outlier_threshold)
+        X_train_clean = X_train[outlier_mask]
+        y_train_clean = y_train[outlier_mask]
+        
+        if len(X_train_clean) < 5:
+            # If too many outliers removed, use original data
+            X_train_clean = X_train
+            y_train_clean = y_train
+        
+        # Choose scaler based on model type
+        if model_id in [3, 6, 7, 9, 10]:  # Neural nets, SVR, Bayesian, Elastic Net, Transformer
             scaler = StandardScaler()
         else:
             scaler = MinMaxScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
+        
+        # Fit scaler and transform data
+        X_train_scaled = scaler.fit_transform(X_train_clean)
+        X_test_scaled = scaler.transform(X_test) if len(X_test) > 0 else X_train_scaled[-1:].copy()
+        
+        # Initialize model based on model_id with CONSERVATIVE parameters for accuracy
         model = None
-        if model_id == 1:
+        if model_id == 1:  # XGBoost - More conservative
             model = xgb.XGBRegressor(
-                objective='reg:quantileerror',
-                quantile_alpha=0.5,
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                random_state=42
+                objective='reg:squarederror',
+                n_estimators=150,  # More trees for stability
+                max_depth=4,       # Shallower trees to prevent overfitting
+                learning_rate=0.03,  # Lower learning rate
+                subsample=0.7,     # More aggressive subsampling
+                colsample_bytree=0.7,
+                reg_alpha=0.1,     # L1 regularization
+                reg_lambda=0.1,    # L2 regularization
+                random_state=42,
+                verbosity=0
             )
-        elif model_id == 2:
+        elif model_id == 2:  # Random Forest - More conservative
             model = RandomForestRegressor(
-                n_estimators=100,
-                max_depth=10,
+                n_estimators=150,  # More trees
+                max_depth=8,       # Shallower depth
+                min_samples_split=10,  # Higher minimum split
+                min_samples_leaf=5,    # Higher minimum leaf
                 bootstrap=True,
-                random_state=42
+                max_features=0.7,  # Use fewer features per tree
+                random_state=42,
+                n_jobs=1
             )
-        elif model_id == 3:
+        elif model_id == 3:  # Neural Network - Smaller and regularized
             model = MLPRegressor(
-                hidden_layer_sizes=(100, 50, 25),
+                hidden_layer_sizes=(64, 32),  # Smaller network
                 activation='relu',
                 solver='adam',
-                alpha=0.001,
-                max_iter=500,
+                alpha=0.01,        # Stronger regularization
+                learning_rate_init=0.0005,  # Lower learning rate
+                max_iter=800,
+                early_stopping=True,
+                validation_fraction=0.1,
                 random_state=42
             )
-        elif model_id == 4:
+        elif model_id == 4:  # Extra Trees - More conservative
             model = ExtraTreesRegressor(
-                n_estimators=100,
-                max_depth=10,
+                n_estimators=150,
+                max_depth=8,
+                min_samples_split=10,
+                min_samples_leaf=5,
                 bootstrap=True,
-                random_state=42
+                max_features=0.7,
+                random_state=42,
+                n_jobs=1
             )
-        elif model_id == 5:
+        elif model_id == 5:  # AdaBoost - More conservative
             model = AdaBoostRegressor(
-                n_estimators=100,
-                learning_rate=0.1,
+                n_estimators=80,   # Fewer estimators
+                learning_rate=0.05,  # Lower learning rate
+                loss='linear',
                 random_state=42
             )
-        elif model_id == 6:
+        elif model_id == 6:  # Bayesian Ridge - More regularized
             model = BayesianRidge(
-                alpha_1=1e-6,
-                alpha_2=1e-6,
-                lambda_1=1e-6,
-                lambda_2=1e-6
+                alpha_1=1e-5,      # Stronger prior
+                alpha_2=1e-5,
+                lambda_1=1e-5,
+                lambda_2=1e-5,
+                fit_intercept=True,
+                compute_score=True
             )
-        elif model_id == 7:
+        elif model_id == 7:  # SVR
             model = SVR(
                 kernel='rbf',
-                C=1.0,
-                epsilon=0.1
+                C=10.0,
+                epsilon=0.1,
+                gamma='scale'
             )
-        elif model_id == 8:
+        elif model_id == 8:  # Gradient Boosting
             model = GradientBoostingRegressor(
                 n_estimators=100,
                 learning_rate=0.1,
                 max_depth=6,
+                subsample=0.8,
                 random_state=42
             )
-        elif model_id == 9:
+        elif model_id == 9:  # Elastic Net
             model = ElasticNet(
                 alpha=0.1,
                 l1_ratio=0.5,
-                random_state=42
+                random_state=42,
+                max_iter=2000
             )
-        elif model_id == 10:
+        elif model_id == 10:  # Transformer-like
             model = TransformerModel(input_dim=X_train_scaled.shape[1])
         else:
-            return [0.0] * 3
-        model.fit(X_train_scaled, y_train)
-        # Use last 3 rows for prediction
-        n_preds = 3
-        X_predict = X[-n_preds:]
-        X_predict_scaled = scaler.transform(X_predict)
-        preds = model.predict(X_predict_scaled)
-        preds = ensure_iterable(preds)  # Ensure predictions are iterable
-        if len(preds) < 3:
-            preds = [0.0] * (3 - len(preds)) + preds
-        return preds
+            print(f"[train_and_predict_model] Unknown model_id: {model_id}")
+            return [0.0]
+        
+        # Add cross-validation for better accuracy assessment
+        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+        
+        try:
+            # Use TimeSeriesSplit for financial data (respects temporal order)
+            tscv = TimeSeriesSplit(n_splits=min(5, len(X_train_scaled)//10), test_size=max(10, len(X_train_scaled)//10))
+            
+            # Perform cross-validation to assess model quality
+            cv_scores = cross_val_score(model, X_train_scaled, y_train_clean, cv=tscv, scoring='neg_mean_squared_error')
+            cv_mean = np.mean(cv_scores)
+            cv_std = np.std(cv_scores)
+            
+            print(f"[train_and_predict_model] Model {model_id} CV Score: {cv_mean:.6f} ± {cv_std:.6f}")
+            
+            # Skip models with very poor cross-validation performance
+            if cv_mean < -0.01:  # If MSE is very high (>1% error), skip this model
+                print(f"[train_and_predict_model] Model {model_id} has poor CV performance, skipping")
+                return [0.0]
+                
+        except Exception as e:
+            print(f"[train_and_predict_model] CV error for model {model_id}: {e}")
+        
+        # Train the model
+        model.fit(X_train_scaled, y_train_clean)
+        
+        # Make predictions on test set (last 20% of data)
+        if len(X_test_scaled) > 0:
+            predictions = model.predict(X_test_scaled)
+            predictions = ensure_iterable(predictions)
+            
+            # Apply prediction calibration/adjustment based on historical performance
+            # Calculate the bias between predictions and actual values on test set
+            if len(predictions) == len(y_test):
+                prediction_bias = np.mean(predictions) - np.mean(y_test)
+                
+                # Apply bias correction to reduce systematic errors
+                calibrated_predictions = [p - prediction_bias for p in predictions]
+                
+                # Also apply shrinkage towards zero to reduce overconfidence
+                shrinkage_factor = 0.7  # Conservative shrinkage
+                final_predictions = [p * shrinkage_factor for p in calibrated_predictions]
+                
+                # Apply bounds checking to individual predictions
+                validated_predictions = []
+                for i, pred in enumerate(final_predictions):
+                    validated_pred, warnings = validate_prediction_bounds(pred, f"Model_{model_id}", strict_mode=False)
+                    validated_predictions.append(validated_pred)
+                    if warnings and i < 3:  # Only log warnings for first 3 predictions to avoid spam
+                        print(f"[train_and_predict_model] Model {model_id} prediction {i}: {warnings[0] if warnings else 'OK'}")
+                
+                print(f"[train_and_predict_model] Model {model_id} bias correction: {prediction_bias:.6f}, validated predictions: {validated_predictions[-3:]}")
+                return validated_predictions
+            else:
+                # Just apply shrinkage if we can't calculate bias
+                shrinkage_factor = 0.7
+                final_predictions = [p * shrinkage_factor for p in predictions]
+                
+                # Apply bounds checking to individual predictions
+                validated_predictions = []
+                for pred in final_predictions:
+                    validated_pred, warnings = validate_prediction_bounds(pred, f"Model_{model_id}", strict_mode=False)
+                    validated_predictions.append(validated_pred)
+                
+                return validated_predictions
+            
+        else:
+            # If no test data, predict on last training sample
+            last_sample = X_train_scaled[-1:] 
+            prediction = model.predict(last_sample)
+            pred_list = ensure_iterable(prediction).tolist()
+            
+            # Apply bounds checking to single prediction
+            if pred_list:
+                validated_pred, warnings = validate_prediction_bounds(pred_list[0], f"Model_{model_id}", strict_mode=False)
+                pred_list = [validated_pred]
+            
+            print(f"[train_and_predict_model] Model {model_id} single prediction: {pred_list}")
+            return pred_list
+        
     except Exception as e:
-        print(f"Error training model {model_id}: {e}")
-        return [0.0] * 3
+        print(f"[train_and_predict_model] Error training model {model_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return [0.0]
 
 def train_models_parallel(stock_data, model_ids, regime=None, regime_strength=0.5):
     """Train models for all stocks using parallel processing, with regime-aware feature weighting."""
@@ -1040,7 +1862,6 @@ def create_prediction_chart(df, prediction, lower, upper, ticker_name):
     plt.close()
     
     return image_base64
-
 def create_multi_stock_prediction_chart(stock_data, stock_predictions, prediction_window):
     """Plot all top N stocks: last X days of history and X days of forecast, normalized to 100 at -X. Fix gap between history and prediction."""
     plt.figure(figsize=(14, 8))
@@ -1059,9 +1880,16 @@ def create_multi_stock_prediction_chart(stock_data, stock_predictions, predictio
         norm_factor = hist.iloc[0]
         hist_norm = hist / norm_factor * 100
         # Simulate predicted path (start at last hist value)
-        pred_path = [hist_norm.iloc[-1]]
-        for i in range(1, prediction_window+1):
-            pred_path.append(pred_path[-1] * (1 + stock['pred']))
+        pred_start = hist_norm.iloc[-1]
+        pred_end = pred_start * (1 + stock['pred'])  # Total return over prediction window
+        
+        # Create linear interpolation from current price to predicted price
+        pred_path = []
+        for i in range(prediction_window + 1):
+            # Linear interpolation: start + (end - start) * (i / prediction_window)
+            progress = i / prediction_window if prediction_window > 0 else 0
+            pred_value = pred_start + (pred_end - pred_start) * progress
+            pred_path.append(pred_value)
         # x-axis: -X to 0 for history, 0 to X for forecast
         x_hist = np.arange(-prediction_window, 1)
         x_pred = np.arange(0, prediction_window+1)
@@ -1115,40 +1943,24 @@ def to_scalar(x):
     else:
         return float(x)
 
-def add_features_single(ticker, df, prediction_window=5):
+def add_features_single(ticker, df, prediction_window=5, market_data_cache=None):
     """Add features to a single ticker's data (no parallelization)."""
-    return add_features_to_stock(ticker, df, prediction_window)
+    return add_features_to_stock(ticker, df, prediction_window, market_data_cache)
 
 def train_model_single(df, model_ids, regime=None, regime_strength=0.5):
-    """Train models for a single ticker (no parallelization)."""
+    """Train models for a single ticker (no parallelization) with bounds checking."""
     if df is None or len(df) < 50:
+        print(f"[train_model_single] DataFrame too short or None")
         return None
+    
     try:
-        feature_columns = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume']]
-        flat_features = {}
-        for col in feature_columns:
-            arr = df[col]
-            arr_flat = [to_scalar(x) for x in arr]
-            arr_flat = pd.to_numeric(arr_flat, errors='coerce')
-            flat_features[col] = arr_flat
-        features_df = pd.DataFrame(flat_features, index=df.index)
-        X = features_df[feature_columns].values.astype(float)
-        y = df['Close'].pct_change().shift(-1).values
-        valid_indices = ~(np.isnan(X).any(axis=1) | np.isnan(y))
-        X = X[valid_indices]
-        y = y[valid_indices]
-        if len(X) < 20:
-            return None
-        if regime is not None:
-            weights_dict = get_indicator_weights(regime, regime_strength)
-            weights = [weights_dict.get(f, 1.0) for f in feature_columns]
-            X = X * weights
-        model_predictions = {}
-        for model_id in model_ids:
-            prediction = train_and_predict_model(X, y, model_id)
-            model_predictions[model_id] = prediction
-        return model_predictions
+        # Use the same logic as train_model_for_stock but for single ticker
+        return train_model_for_stock("SINGLE_TICKER", df, model_ids, regime, regime_strength)
+        
     except Exception as e:
+        print(f"[train_model_single] ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def predict_single_ticker_chart(df, predictions, prediction_window):
@@ -1159,25 +1971,76 @@ def predict_single_ticker_chart(df, predictions, prediction_window):
     plt.style.use('dark_background')
     if df is None or len(df) < prediction_window + 1:
         return None
-    hist = df['Close'].iloc[-prediction_window-1:]
-    norm_factor = hist.iloc[0]
+    
+    # Get history data - last prediction_window + 1 days so we have prediction_window days of history plus current
+    hist = df['Close'].iloc[-(prediction_window+1):]
+    norm_factor = hist.iloc[0]  # First value becomes 100
     hist_norm = hist / norm_factor * 100
-    avg_pred = np.mean(list(predictions.values()))
-    # History
+    
+    # DEBUG: Print prediction values to understand what we're getting
+    print(f"[predict_single_ticker_chart] Raw predictions: {predictions}")
+    
+    # Handle different prediction formats safely
+    prediction_values = []
+    if isinstance(predictions, dict):
+        # Check for new structured format from train_model_for_stock
+        if 'prediction' in predictions:
+            avg_pred = predictions['prediction']
+            print(f"[predict_single_ticker_chart] Using structured format prediction: {avg_pred}")
+        else:
+            # Old format: extract from individual model predictions
+            for k, v in predictions.items():
+                if isinstance(v, dict) and 'avg_pred' in v:
+                    prediction_values.append(v['avg_pred'])
+                elif isinstance(v, (int, float)):
+                    prediction_values.append(float(v))
+                elif isinstance(v, (list, np.ndarray)) and len(v) > 0:
+                    prediction_values.append(float(v[-1]) if hasattr(v[-1], '__float__') else 0.0)
+            
+            avg_pred = np.mean(prediction_values) if len(prediction_values) > 0 else 0.0
+            print(f"[predict_single_ticker_chart] Extracted individual predictions: {prediction_values}, average: {avg_pred}")
+    else:
+        avg_pred = float(predictions) if predictions is not None else 0.0
+        print(f"[predict_single_ticker_chart] Single prediction value: {avg_pred}")
+    
+    # Ensure prediction is reasonable (should be small decimal like 0.0007 for 0.07%)
+    if abs(avg_pred) > 1.0:
+        print(f"[predict_single_ticker_chart] WARNING: Prediction {avg_pred} seems too large, capping at ±0.1")
+        avg_pred = np.sign(avg_pred) * min(abs(avg_pred), 0.1)
+    
+    print(f"[predict_single_ticker_chart] Final prediction: {avg_pred} ({avg_pred*100:.3f}%)")
+    
+    # History - show actual price movement over last prediction_window days
     x_hist = np.arange(-prediction_window, 1)
     plt.plot(x_hist, hist_norm.values, color='cyan', linewidth=2, label="History")
+    
     # Prediction (dashed, same color)
-    pred_start = hist_norm.values[-1]
-    pred_path = [pred_start]
-    for i in range(1, prediction_window+1):
-        pred_path.append(pred_path[-1] * (1 + avg_pred))
+    pred_start = hist_norm.values[-1]  # Start from last historical price
+    pred_end = pred_start * (1 + avg_pred)  # End price after prediction_window days
+    
+    print(f"[predict_single_ticker_chart] Chart: start={pred_start:.2f}, end={pred_end:.2f}")
+    
+    # Create linear interpolation from current price to predicted price
+    pred_path = []
+    for i in range(prediction_window + 1):
+        # Linear interpolation: start + (end - start) * (i / prediction_window)
+        progress = i / prediction_window if prediction_window > 0 else 0
+        pred_value = pred_start + (pred_end - pred_start) * progress
+        pred_path.append(pred_value)
+    
     x_pred = np.arange(0, prediction_window+1)
     plt.plot(x_pred, pred_path, color='cyan', linewidth=2, linestyle='--', label="Prediction")
     plt.xlabel(f"Days (0 = present, -N = history, N = forecast)", color='white')
     plt.ylabel("Normalized Price (Start = 100)", color='white')
-    plt.title(f"Single Ticker Prediction (window={prediction_window} days)", color='white', fontsize=16)
+    plt.title(f"Single Ticker Prediction (window={prediction_window} days) - Pred: {avg_pred*100:.3f}%", color='white', fontsize=16)
     plt.legend()
     plt.grid(True, alpha=0.3)
+    
+    # Add text annotation showing the actual prediction percentage
+    plt.text(0.02, 0.98, f"Prediction: {avg_pred*100:.3f}% over {prediction_window} days", 
+             transform=plt.gca().transAxes, color='white', fontsize=12, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+    
     buffer = io.BytesIO()
     plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight', facecolor='#1e293b', edgecolor='none')
     buffer.seek(0)
@@ -1211,6 +2074,9 @@ def predict():
             ticker_to_analyze = custom_ticker
             if not ticker_to_analyze:
                 return jsonify({'error': 'Please enter a valid ticker symbol (e.g., AAPL, MSFT)'}), 400
+            
+            print("Downloading market reference data...")
+            market_data_cache = download_market_data_cache(start_date, force_refresh)
             spy_df = download_single_ticker_data('SPY', start_date)
             if spy_df is not None:
                 market_condition, market_strength = detect_market_regime(spy_df)
@@ -1218,12 +2084,18 @@ def predict():
                 market_condition, market_strength = 'sideways', 0.5
             if model_selection == 'auto':
                 selected_models = select_models_for_market(market_condition, is_custom)
+                print(f"[predict] Single ticker auto model selection: {selected_models} for market condition: {market_condition}")
             elif not selected_models:
                 selected_models = [2, 7, 6]
+                print(f"[predict] Single ticker default model selection: {selected_models}")
+            else:
+                print(f"[predict] Single ticker user-selected models: {selected_models}")
+            
+            print(f"[predict] Final selected_models for single ticker: {selected_models}")
             df = download_single_ticker_data(ticker_to_analyze, start_date)
             if df is None or df.empty or len(df) < 50:
                 return jsonify({'error': f'❌ Could not fetch data for {ticker_to_analyze}. Please check the ticker symbol and try again.'}), 400
-            features_df = add_features_single(ticker_to_analyze, df, prediction_window)
+            features_df = add_features_to_stock(ticker_to_analyze, df, prediction_window, market_data_cache)
             if features_df is None or features_df.empty:
                 return jsonify({'error': '❌ Could not process technical indicators. Data may be corrupted or insufficient.'}), 400
             model_preds = train_model_single(features_df, selected_models, market_condition, market_strength)
@@ -1249,9 +2121,12 @@ def predict():
                 'plot_image': chart_image,
                 'system_messages': []
             }
-            return jsonify(response)
+            print(f"[predict] Single ticker response selected_models: {response['selected_models']}")
+            return jsonify(sanitize_for_json(response))
         else:
             print(f"Starting multi-ticker analysis for {index} with {num_stocks} stocks...")
+            print("Downloading market reference data...")
+            market_data_cache = download_market_data_cache(start_date, force_refresh)
             print("Downloading stock data...")
             result = download_index_data(index, start_date, force_refresh=force_refresh)
             if isinstance(result, tuple):
@@ -1267,7 +2142,7 @@ def predict():
                 return jsonify({'error': error_msg}), 400
             print(f"Downloaded data for {len(stock_data)} stocks (skipped {len(failed_downloads)} failed tickers)")
             print("Adding technical features...")
-            processed_data = add_features_parallel(stock_data, prediction_window)
+            processed_data = add_features_parallel(stock_data, prediction_window, market_data_cache)
             if not processed_data:
                 print(f"ERROR: Could not process features")
                 return jsonify({'error': '❌ Could not process technical indicators. Data may be corrupted or insufficient.'}), 400
@@ -1294,6 +2169,11 @@ def predict():
             for ticker, model_predictions in trained_models.items():
                 if etf_ticker and ticker == etf_ticker:
                     continue  # Skip the ETF ticker in stock_predictions
+                
+                # Debug: print model predictions for first few stocks
+                if len(stock_predictions) < 3:
+                    print(f"[DEBUG] {ticker} model predictions: {model_predictions}")
+                
                 # Use improved confidence interval calculation for each stock
                 stock_df = stock_data.get(ticker)
                 ci = fixed_single_ticker_prediction(
@@ -1391,7 +2271,7 @@ def predict():
                     'type': 'info',
                     'message': f'📈 Analyzed {len(stock_data)} stocks (requested {num_stocks})'
                 })
-        return jsonify(response)
+        return jsonify(sanitize_for_json(response))
     except Exception as e:
         print(f"Error in prediction: {e}")
         return jsonify({'error': str(e)}), 500
