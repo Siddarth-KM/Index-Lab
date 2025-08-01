@@ -43,87 +43,55 @@ from scipy import stats
 app = Flask(__name__)
 CORS(app)
 
+# ============================================================================
+# CONSTANTS SECTION
+# ============================================================================
+
+# Machine Learning Constants
+MIN_DATA_POINTS = 50  # Minimum data points required for training
+MIN_FEATURES = 5  # Minimum features required for training
+MIN_CONFIDENCE_SAMPLES = 30  # Minimum samples for confidence calculations
+DEFAULT_CONFIDENCE_LEVEL = 95  # Default confidence level percentage
+DEFAULT_MARGIN_ERROR = 0.05  # Default margin of error (5%)
+TRADING_DAYS_YEAR = 252  # Number of trading days in a year
+FEATURE_ROLLING_WINDOW = 20  # Default rolling window for features
+VIX_HIGH_THRESHOLD = 25  # VIX level considered high fear
+VIX_VERY_HIGH_THRESHOLD = 30  # VIX level considered very high fear
+VIX_LOW_THRESHOLD = 15   # VIX level considered low fear
+FORWARD_FILL_LIMIT = 5   # Maximum days to forward fill missing data
+
+# Market Condition Thresholds
+SIDEWAYS_PRICE_THRESHOLD = 0.05  # Price change threshold for sideways market
+SIDEWAYS_SMA_THRESHOLD = 0.03    # SMA change threshold for sideways market
+BULL_PRICE_THRESHOLD = 0.1       # Price change threshold for bull market
+BULL_SMA_THRESHOLD = 0.05        # SMA change threshold for bull market
+BEAR_PRICE_THRESHOLD = -0.1      # Price change threshold for bear market
+BEAR_SMA_THRESHOLD = -0.05       # SMA change threshold for bear market
+HIGH_VOLATILITY_THRESHOLD = 0.03 # Volatility threshold for volatile market
+
+# Regime-based Volatility Constants
+REGIME_VOLATILITY_BULL = 0.015     # Base volatility for bull market
+REGIME_VOLATILITY_BEAR = 0.025     # Base volatility for bear market
+REGIME_VOLATILITY_SIDEWAYS = 0.02  # Base volatility for sideways market
+REGIME_VOLATILITY_VOLATILE = 0.035 # Base volatility for volatile market
+VOLATILITY_ADJUSTMENT_BASE = 0.5   # Base multiplier for volatility adjustment
+
+# Cache and Data Management Constants
+CACHE_MAX_SIZE = 50  # Maximum number of cache entries to prevent memory bloat
+CACHE_MAX_AGE_HOURS = 24  # Maximum age of cache entries in hours
+
+# Market symbols for cross-asset features
+MARKET_SYMBOLS = ['SPY', 'VIX', 'DXY', 'TLT', 'GLD', 'QQQ']
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def ensure_iterable(obj):
     """Ensure the object is iterable. If not, wrap it in a list."""
     if isinstance(obj, (list, np.ndarray, pd.Series)):
         return obj
     return [obj]
-
-def validate_prediction_bounds(prediction, ticker, historical_data=None, strict_mode=True):
-    """
-    Validate prediction against historical bounds and market reality.
-    Returns validated prediction and warning flags.
-    """
-    try:
-        original_pred = float(prediction)
-        validated_pred = original_pred
-        warnings = []
-        
-        # Define absolute bounds based on market reality
-        if strict_mode:
-            max_daily_return = 0.20   # 20% max daily move (very conservative)
-            normal_daily_limit = 0.10  # 10% for normal market conditions
-        else:
-            max_daily_return = 0.30   # 30% max daily move (less conservative)
-            normal_daily_limit = 0.15  # 15% for normal market conditions
-        
-        # Check absolute bounds
-        if abs(original_pred) > max_daily_return:
-            validated_pred = np.sign(original_pred) * max_daily_return
-            warnings.append(f"EXTREME: Prediction {original_pred*100:.2f}% clamped to {validated_pred*100:.2f}%")
-        elif abs(original_pred) > normal_daily_limit:
-            # Apply soft clamping for large but not extreme predictions
-            excess = abs(original_pred) - normal_daily_limit
-            damping_factor = 0.5  # Reduce excess by 50%
-            validated_pred = np.sign(original_pred) * (normal_daily_limit + excess * damping_factor)
-            warnings.append(f"LARGE: Prediction {original_pred*100:.2f}% damped to {validated_pred*100:.2f}%")
-        
-        # Historical bounds checking if data is available
-        if historical_data is not None and len(historical_data) > 50:
-            try:
-                # Calculate historical daily returns
-                daily_returns = historical_data['Close'].pct_change().dropna()
-                
-                if len(daily_returns) > 30:
-                    # Historical percentiles
-                    hist_99 = np.percentile(daily_returns, 99)
-                    hist_1 = np.percentile(daily_returns, 1)
-                    hist_95 = np.percentile(daily_returns, 95)
-                    hist_5 = np.percentile(daily_returns, 5)
-                    
-                    # Check against historical extremes (99th/1st percentile)
-                    if validated_pred > hist_99 * 1.5:  # 1.5x historical extreme
-                        validated_pred = hist_99 * 1.2  # Cap at 1.2x historical extreme
-                        warnings.append(f"HISTORICAL: Prediction above 1.5x historical 99th percentile, capped")
-                    elif validated_pred < hist_1 * 1.5:
-                        validated_pred = hist_1 * 1.2
-                        warnings.append(f"HISTORICAL: Prediction below 1.5x historical 1st percentile, capped")
-                    
-                    # Check against normal historical range (95th/5th percentile)
-                    elif validated_pred > hist_95 * 2.0:
-                        validated_pred = hist_95 * 1.5
-                        warnings.append(f"RANGE: Prediction above 2x historical 95th percentile, reduced")
-                    elif validated_pred < hist_5 * 2.0:
-                        validated_pred = hist_5 * 1.5
-                        warnings.append(f"RANGE: Prediction below 2x historical 5th percentile, reduced")
-                        
-            except Exception as e:
-                warnings.append(f"Historical validation failed: {e}")
-        
-        # Sanity check: predictions should not be exactly zero unless intended
-        if abs(validated_pred) < 1e-6 and abs(original_pred) > 1e-4:
-            validated_pred = np.sign(original_pred) * 0.001  # Minimum 0.1% prediction
-            warnings.append("ZERO: Tiny prediction increased to minimum threshold")
-        
-        # Log validation results if there were changes
-        if warnings:
-            print(f"[validate_prediction_bounds] {ticker}: {'; '.join(warnings)}")
-        
-        return float(validated_pred), warnings
-        
-    except Exception as e:
-        print(f"[validate_prediction_bounds] Error for {ticker}: {e}")
-        return float(prediction) if prediction is not None else 0.0, [f"Validation error: {e}"]
 
 def sanitize_for_json(obj):
     """Recursively replace NaN and inf values with None for JSON serialization."""
@@ -141,7 +109,7 @@ def sanitize_for_json(obj):
         return obj
 
 # --- Improved Confidence Interval Calculations ---
-def calculate_proper_confidence_interval(predictions, confidence_level=95, base_volatility=0.02):
+def calculate_proper_confidence_interval(predictions, confidence_level=DEFAULT_CONFIDENCE_LEVEL, base_volatility=0.02):
     """
     Calculate proper confidence intervals based on model ensemble variance
     and historical volatility.
@@ -166,7 +134,7 @@ def calculate_proper_confidence_interval(predictions, confidence_level=95, base_
     if np.isnan(total_uncertainty) or total_uncertainty == 0:
         total_uncertainty = base_volatility
     
-    if len(pred_values) < 30:
+    if len(pred_values) < MIN_CONFIDENCE_SAMPLES:
         alpha = (100 - confidence_level) / 100
         t_value = stats.t.ppf(1 - alpha/2, df=len(pred_values)-1)
         margin_of_error = t_value * total_uncertainty
@@ -177,22 +145,22 @@ def calculate_proper_confidence_interval(predictions, confidence_level=95, base_
     
     # Ensure margin_of_error is not NaN
     if np.isnan(margin_of_error):
-        margin_of_error = 0.05  # Default 5% margin
+        margin_of_error = DEFAULT_MARGIN_ERROR  # Default 5% margin
     
     lower_bound = mean_pred - margin_of_error
     upper_bound = mean_pred + margin_of_error
     return lower_bound, upper_bound
 
-def calculate_regime_adjusted_confidence(predictions, market_condition, market_strength, confidence_level=95):
+def calculate_regime_adjusted_confidence(predictions, market_condition, market_strength, confidence_level=DEFAULT_CONFIDENCE_LEVEL):
     """Calculate confidence intervals based on market regime"""
     regime_volatility = {
-        'bull': 0.015,
-        'bear': 0.025,
-        'sideways': 0.018,
-        'volatile': 0.035
+        'bull': REGIME_VOLATILITY_BULL,
+        'bear': REGIME_VOLATILITY_BEAR,
+        'sideways': REGIME_VOLATILITY_SIDEWAYS,
+        'volatile': REGIME_VOLATILITY_VOLATILE
     }
-    base_vol = regime_volatility.get(market_condition, 0.02)
-    adjusted_vol = base_vol * (0.5 + market_strength)
+    base_vol = regime_volatility.get(market_condition, REGIME_VOLATILITY_SIDEWAYS)
+    adjusted_vol = base_vol * (VOLATILITY_ADJUSTMENT_BASE + market_strength)
     
     print(f"[calculate_regime_adjusted_confidence] Market: {market_condition}, strength: {market_strength}")
     print(f"[calculate_regime_adjusted_confidence] Base vol: {base_vol:.6f}, adjusted vol: {adjusted_vol:.6f}")
@@ -216,9 +184,9 @@ def calculate_regime_adjusted_confidence(predictions, market_condition, market_s
     
     return lower_bound, upper_bound
 
-def calculate_historical_confidence(df, predictions, confidence_level=95, lookback_days=252, prediction_window=5):
+def calculate_historical_confidence(df, predictions, confidence_level=DEFAULT_CONFIDENCE_LEVEL, lookback_days=TRADING_DAYS_YEAR, prediction_window=5):
     """Calculate confidence intervals using historical volatility"""
-    if df is None or len(df) < 30:
+    if df is None or len(df) < MIN_CONFIDENCE_SAMPLES:
         # Fallback to basic confidence calculation
         if not hasattr(predictions, '__len__') or isinstance(predictions, (str, np.number)):
             predictions = [predictions]
@@ -227,11 +195,11 @@ def calculate_historical_confidence(df, predictions, confidence_level=95, lookba
     
     # Calculate historical volatility
     returns = df['Close'].pct_change().dropna()
-    if len(returns) < 30:
+    if len(returns) < MIN_CONFIDENCE_SAMPLES:
         # Not enough data for meaningful volatility calculation
         return calculate_proper_confidence_interval([predictions], confidence_level)
     
-    # Use available data, but at least 30 days
+    # Use available data, but at least MIN_CONFIDENCE_SAMPLES days
     lookback_data = returns.tail(min(lookback_days, len(returns)))
     historical_vol = lookback_data.std()
     
@@ -347,52 +315,61 @@ MODEL_CONFIGS = {
     10: {'name': 'Transformer', 'description': 'Deep learning, sequence modeling'}
 }
 
-# Market symbols for cross-asset features
-MARKET_SYMBOLS = ['SPY', 'VIX', 'DXY', 'TLT', 'GLD', 'QQQ']
-market_data_cache = {}  # Global cache for market data
-CACHE_MAX_SIZE = 50  # Maximum number of cache entries to prevent memory bloat
-CACHE_MAX_AGE_HOURS = 24  # Maximum age of cache entries in hours
+# Global cache for market data
+market_data_cache = {}
 
 def manage_cache_size():
     """Manage cache size to prevent memory bloat"""
     global market_data_cache
     
-    if len(market_data_cache) <= CACHE_MAX_SIZE:
-        return
-    
-    print(f"[manage_cache_size] Cache size ({len(market_data_cache)}) exceeds limit ({CACHE_MAX_SIZE}), cleaning up...")
-    
-    # Remove oldest entries based on access time or creation time
-    # For simplicity, we'll clear half the cache when it gets too large
-    cache_items = list(market_data_cache.items())
-    items_to_keep = cache_items[:CACHE_MAX_SIZE // 2]
-    
-    market_data_cache = dict(items_to_keep)
-    print(f"[manage_cache_size] Cache cleaned, new size: {len(market_data_cache)}")
+    with cache_lock:
+        if len(market_data_cache) <= CACHE_MAX_SIZE:
+            return
+        
+        print(f"[manage_cache_size] Cache size ({len(market_data_cache)}) exceeds limit ({CACHE_MAX_SIZE}), cleaning up...")
+        
+        # Remove oldest entries based on access time or creation time
+        # For simplicity, we'll clear half the cache when it gets too large
+        cache_items = list(market_data_cache.items())
+        items_to_keep = cache_items[:CACHE_MAX_SIZE // 2]
+        
+        market_data_cache = dict(items_to_keep)
+        print(f"[manage_cache_size] Cache cleaned, new size: {len(market_data_cache)}")
 
 def clear_stale_cache():
     """Clear cache entries older than CACHE_MAX_AGE_HOURS"""
     global market_data_cache
     
     try:
-        import time
         current_time = time.time()
         stale_keys = []
         
         # Check cache files for staleness
-        for cache_key in os.listdir(CACHE_DIR):
-            if cache_key.endswith('.pkl'):
-                cache_file = os.path.join(CACHE_DIR, cache_key)
-                file_age_hours = (current_time - os.path.getmtime(cache_file)) / 3600
-                
-                if file_age_hours > CACHE_MAX_AGE_HOURS:
-                    stale_keys.append(cache_key)
+        if os.path.exists(CACHE_DIR):
+            for cache_key in os.listdir(CACHE_DIR):
+                if cache_key.endswith('.pkl'):
+                    cache_file = os.path.join(CACHE_DIR, cache_key)
+                    try:
+                        file_age_hours = (current_time - os.path.getmtime(cache_file)) / 3600
+                        
+                        if file_age_hours > CACHE_MAX_AGE_HOURS:
+                            stale_keys.append(cache_key)
+                    except OSError:
+                        # File might have been deleted concurrently
+                        continue
         
-        # Remove stale files
+        # Remove stale files and clear from memory cache
         for key in stale_keys:
             try:
-                os.remove(os.path.join(CACHE_DIR, key))
-                print(f"[clear_stale_cache] Removed stale cache file: {key}")
+                cache_file_path = os.path.join(CACHE_DIR, key)
+                if os.path.exists(cache_file_path):
+                    os.remove(cache_file_path)
+                    print(f"[clear_stale_cache] Removed stale cache file: {key}")
+                
+                # Also remove from memory cache if present
+                cache_base_key = key.replace('.pkl', '')
+                if cache_base_key in market_data_cache:
+                    del market_data_cache[cache_base_key]
             except Exception as e:
                 print(f"[clear_stale_cache] Error removing {key}: {e}")
         
@@ -430,7 +407,8 @@ def get_cached_data(cache_key):
                 try:
                     with open(cache_file, 'rb') as f:
                         return pickle.load(f)
-                except:
+                except (pickle.PickleError, IOError, EOFError) as e:
+                    print(f"Cache read error for {cache_key}: {e}")
                     pass
     return None
 
@@ -547,8 +525,12 @@ def scrape_index_constituents(index_name, force_refresh=False):
         core = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
         save_to_cache(cache_key, core)
         return core
+    except requests.RequestException as e:
+        print(f"Network error scraping {index_name}: {e}")
+        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
     except Exception as e:
-        print(f"Error scraping {index_name}: {e}")
+        print(f"Unexpected error scraping {index_name}: {e}")
+        traceback.print_exc()
         return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
 
 def download_market_data_cache(start_date, force_refresh=False):
@@ -648,13 +630,13 @@ def download_index_data(index_name, start_date, force_refresh=False):
 
 def calculate_market_condition(df):
     """Determine market condition based on price data"""
-    if df is None or len(df) < 20:
+    if df is None or len(df) < FEATURE_ROLLING_WINDOW:
         return 'sideways', 0.5
     
     # Calculate technical indicators
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    df['SMA_20'] = df['Close'].rolling(window=FEATURE_ROLLING_WINDOW).mean()
     df['SMA_50'] = df['Close'].rolling(window=50).mean()
-    df['Volatility'] = df['Close'].pct_change().rolling(window=20).std()
+    df['Volatility'] = df['Close'].pct_change().rolling(window=FEATURE_ROLLING_WINDOW).std()
     
     # Get recent data
     recent = df.tail(30)
@@ -665,16 +647,16 @@ def calculate_market_condition(df):
     avg_volatility = recent['Volatility'].mean()
     
     # Determine market condition
-    if abs(price_trend) < 0.05 and abs(sma_trend) < 0.03:
+    if abs(price_trend) < SIDEWAYS_PRICE_THRESHOLD and abs(sma_trend) < SIDEWAYS_SMA_THRESHOLD:
         condition = 'sideways'
         strength = 0.3
-    elif price_trend > 0.1 and sma_trend > 0.05:
+    elif price_trend > BULL_PRICE_THRESHOLD and sma_trend > BULL_SMA_THRESHOLD:
         condition = 'bull'
         strength = min(0.9, 0.5 + abs(price_trend))
-    elif price_trend < -0.1 and sma_trend < -0.05:
+    elif price_trend < BEAR_PRICE_THRESHOLD and sma_trend < BEAR_SMA_THRESHOLD:
         condition = 'bear'
         strength = min(0.9, 0.5 + abs(price_trend))
-    elif avg_volatility > 0.03:
+    elif avg_volatility > HIGH_VOLATILITY_THRESHOLD:
         condition = 'volatile'
         strength = min(0.8, 0.4 + avg_volatility * 10)
     else:
@@ -715,7 +697,7 @@ def flatten_series(s):
 
 def detect_market_regime(etf_df):
     """Robust regime detection using multiple indicators from the index ETF ticker's data."""
-    if etf_df is None or len(etf_df) < 50:
+    if etf_df is None or len(etf_df) < MIN_DATA_POINTS:
         return 'sideways', 0.5
     df = etf_df.copy()
     # Calculate indicators if not present
@@ -811,7 +793,7 @@ def calc_slope(x):
 
 def add_features_to_stock_original(ticker, df, prediction_window=5):
     """Original feature engineering function (backup)"""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < MIN_DATA_POINTS:
         print(f"[add_features_to_stock_original] {ticker}: DataFrame is None or too short ({len(df) if df is not None else 0} rows)")
         return None
     try:
@@ -1014,7 +996,7 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
 
 def add_features_to_stock(ticker, df, prediction_window=5, market_data_cache=None):
     """Enhanced version with cross-asset features"""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < MIN_DATA_POINTS:
         print(f"[add_features_to_stock] {ticker}: DataFrame too short or None")
         return None
     
@@ -1306,9 +1288,9 @@ def get_indicator_weights(regime, regime_strength):
         weights[feature] = min(1.4, max(0.7, final_weight))
     return weights
 
-def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.5):
+def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.5, prediction_window=5):
     """Train models for a single stock, with regime-aware feature weighting."""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < MIN_DATA_POINTS:
         print(f"[train_model_for_stock] {ticker}: DataFrame too short or None")
         return None
     
@@ -1327,7 +1309,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
             print(f"[train_model_for_stock] {ticker}: Insufficient technical features ({len(technical_features)})")
             return None
         
-        # Clean and prepare features
+        # Clean and prepare features with improved missing data handling
         df_clean = df.copy()
         for col in feature_columns:
             if col in df_clean.columns:
@@ -1336,6 +1318,12 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                 if series.dtype == 'object':
                     series = series.apply(lambda x: x[0] if isinstance(x, (np.ndarray, list)) and len(x) > 0 else x)
                 df_clean[col] = pd.to_numeric(series, errors='coerce')
+                
+                # Forward fill small gaps (up to FORWARD_FILL_LIMIT days)
+                if df_clean[col].isna().any():
+                    df_clean[col] = df_clean[col].fillna(method='ffill', limit=FORWARD_FILL_LIMIT)
+                    # If still NaN, try backward fill for very early periods
+                    df_clean[col] = df_clean[col].fillna(method='bfill', limit=FORWARD_FILL_LIMIT)
         
         # Remove columns that are all NaN and validate feature quality
         valid_features = []
@@ -1365,18 +1353,64 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
             print(f"[train_model_for_stock] {ticker}: Not enough valid features ({len(valid_features)})")
             return None
         
-        # Prepare feature matrix
-        X = df_clean[valid_features].values.astype(float)
+        # Prepare feature matrix - EXCLUDE future-looking features to prevent data leakage
+        future_looking_features = [
+            f'close_lead_{prediction_window}', 
+            f'forward_return_{prediction_window}',
+            f'rolling_max_{prediction_window}',
+            f'rolling_min_{prediction_window}',
+            # Additional patterns that might indicate future data
+            'lead_', 'future_', 'forward_', 'next_'
+        ]
+        
+        # More comprehensive exclusion using pattern matching
+        valid_features_filtered = []
+        excluded_features = []
+        
+        for col in valid_features:
+            should_exclude = False
+            # Check exact matches
+            if col in future_looking_features:
+                should_exclude = True
+            # Check patterns
+            else:
+                for pattern in ['lead_', 'future_', 'forward_', 'next_']:
+                    if pattern in col.lower():
+                        should_exclude = True
+                        break
+            
+            if should_exclude:
+                excluded_features.append(col)
+            else:
+                valid_features_filtered.append(col)
+        if excluded_features:
+            print(f"[train_model_for_stock] {ticker}: 🚫 EXCLUDED future-looking features: {excluded_features}")
+        print(f"[train_model_for_stock] {ticker}: ✅ Using {len(valid_features_filtered)} features (excluding {len(excluded_features)} future-looking)")
+        
+        if len(valid_features_filtered) < 5:
+            print(f"[train_model_for_stock] {ticker}: ❌ Not enough valid features after removing future-looking ones ({len(valid_features_filtered)})")
+            return None
+            
+        X = df_clean[valid_features_filtered].values.astype(float)
         
         # Apply regime-based feature weights if provided
         if regime is not None:
             weights_dict = get_indicator_weights(regime, regime_strength)
-            weights = np.array([weights_dict.get(col, 1.0) for col in valid_features])
+            weights = np.array([weights_dict.get(col, 1.0) for col in valid_features_filtered])
             X = X * weights
         
-        # Prepare target: future returns
-        # Use simple 1-day forward return as primary target
-        future_returns = df_clean['Close'].pct_change().shift(-1).values
+        # Prepare target: N-day forward return (the actual prediction target)
+        target_column = f'forward_return_{prediction_window}'
+        if target_column in df_clean.columns:
+            future_returns = df_clean[target_column].values
+            print(f"[train_model_for_stock] {ticker}: ✅ TRAINING TARGET: {prediction_window}-day forward return (from feature column)")
+        else:
+            # Fallback to calculating N-day forward return on the fly
+            future_returns = (df_clean['Close'].shift(-prediction_window) / df_clean['Close']) - 1
+            future_returns = future_returns.values
+            print(f"[train_model_for_stock] {ticker}: ✅ TRAINING TARGET: {prediction_window}-day forward return (calculated on-the-fly)")
+        
+        print(f"[train_model_for_stock] {ticker}: 🎯 Models will predict {prediction_window}-day future returns, NOT 1-day returns!")
         
         # DO NOT scale - keep returns in their natural scale for accuracy
         # Small returns (0.001 = 0.1%) are normal and should be preserved
@@ -1393,7 +1427,8 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
         # Print some debugging info about target distribution
         y_std = np.std(y_clean)
         y_mean = np.mean(y_clean)
-        print(f"[train_model_for_stock] {ticker}: Target stats - Mean: {y_mean:.6f} ({y_mean*100:.3f}%), Std: {y_std:.6f} ({y_std*100:.3f}%)")
+        print(f"[train_model_for_stock] {ticker}: 📊 TARGET ({prediction_window}-day returns) - Mean: {y_mean:.6f} ({y_mean*100:.3f}%), Std: {y_std:.6f} ({y_std*100:.3f}%)")
+        print(f"[train_model_for_stock] {ticker}: 📈 Training {len(model_ids)} models to predict {prediction_window}-day forward returns")
         
         # Train models and get predictions
         model_predictions = {}
@@ -1410,15 +1445,12 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                     # NO SCALING - keep predictions in natural decimal scale
                     avg_pred = raw_pred
                     
-                    # Conservative clamping to reasonable range (±20% max)
-                    avg_pred = np.clip(avg_pred, -0.20, 0.20)
-                    
                     model_predictions[model_id] = {
                         'avg_pred': avg_pred,
                         'all_preds': pred_result if isinstance(pred_result, list) else [avg_pred]
                     }
                     
-                    print(f"[train_model_for_stock] {ticker}: Model {model_id} prediction: {avg_pred:.6f} ({avg_pred*100:.3f}%)")
+                    print(f"[train_model_for_stock] {ticker}: Model {model_id} predicts {prediction_window}-day return: {avg_pred:.6f} ({avg_pred*100:.3f}%)")
                 else:
                     print(f"[train_model_for_stock] {ticker}: Model {model_id} returned None")
                     model_predictions[model_id] = {'avg_pred': 0.0, 'all_preds': [0.0]}
@@ -1439,32 +1471,24 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                 pred_std = np.std(valid_predictions) if len(valid_predictions) > 1 else 0.0
                 pred_spread = np.max(valid_predictions) - np.min(valid_predictions) if len(valid_predictions) > 1 else 0.0
                 
-                # Conservative confidence scoring (lower confidence = more conservative prediction)
-                confidence = max(0.1, 1.0 - (pred_spread * 10))  # High spread = low confidence
+                # Improved confidence calculation - less harsh, more realistic
+                # Typical stock returns have spreads of 0.01-0.05 (1-5%), so normalize accordingly
+                normalized_spread = pred_spread / 0.02  # Normalize to 2% spread = 1.0
+                confidence = max(0.2, 1.0 - (normalized_spread * 0.3))  # More gradual penalty
                 
-                # Apply confidence damping to reduce overconfident predictions
-                ensemble_pred = ensemble_pred * confidence
-                
-                # Apply prediction bounds validation
-                validated_pred, validation_warnings = validate_prediction_bounds(
-                    ensemble_pred, ticker, df, strict_mode=True
-                )
-                
-                print(f"[train_model_for_stock] {ticker}: Raw ensemble: {ensemble_pred:.6f} ({ensemble_pred*100:.3f}%)")
-                print(f"[train_model_for_stock] {ticker}: Validated: {validated_pred:.6f} ({validated_pred*100:.3f}%)")
-                print(f"[train_model_for_stock] {ticker}: Confidence: {confidence:.3f}, Spread: {pred_spread:.6f}")
-                if validation_warnings:
-                    print(f"[train_model_for_stock] {ticker}: Validation warnings: {len(validation_warnings)}")
+                print(f"[train_model_for_stock] {ticker}: 🎯 Raw {prediction_window}-day ensemble: {ensemble_pred:.6f} ({ensemble_pred*100:.3f}%)")
+                print(f"[train_model_for_stock] {ticker}: ✅ Final {prediction_window}-day prediction: {ensemble_pred:.6f} ({ensemble_pred*100:.3f}%)")
+                print(f"[train_model_for_stock] {ticker}: 📊 Confidence: {confidence:.3f}, Spread: {pred_spread:.6f}")
                 
                 return {
-                    'prediction': float(validated_pred),
-                    'percentage': float(validated_pred * 100),
+                    'prediction': float(ensemble_pred),
+                    'percentage': float(ensemble_pred * 100),
                     'confidence': float(confidence),
                     'individual_predictions': {k: v['avg_pred'] for k, v in model_predictions.items()},
                     'valid_models': len(valid_predictions),
                     'total_models': len(model_predictions),
-                    'validation_applied': len(validation_warnings) > 0,
-                    'validation_warnings': validation_warnings
+                    'validation_applied': False,
+                    'validation_warnings': []
                 }
             else:
                 print(f"[train_model_for_stock] {ticker}: No valid predictions found")
@@ -1488,6 +1512,14 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
             }
         
         print(f"[train_model_for_stock] {ticker}: Completed with {len(model_predictions)} models, features: {len(valid_features)}, samples: {len(X_clean)}")
+        
+        # Explicit cleanup to prevent memory leaks
+        del X_clean, y_clean
+        if 'df_clean' in locals():
+            del df_clean
+        if 'valid_features_filtered' in locals():
+            del valid_features_filtered
+            
         return model_predictions
         
     except Exception as e:
@@ -1501,25 +1533,33 @@ class TransformerModel:
     def __init__(self, input_dim, d_model=64, nhead=8, num_layers=2):
         self.input_dim = input_dim
         self.d_model = d_model
-        self.nhead = nhead
-        self.num_layers = num_layers
-        # Use MLPRegressor as transformer alternative
+        # Configure hidden layers based on num_layers and d_model
+        if num_layers == 1:
+            hidden_layers = (d_model,)
+        elif num_layers == 2:
+            hidden_layers = (d_model, d_model//2)
+        else:
+            # For more layers, create a progressive reduction
+            hidden_layers = tuple(d_model // (2**i) for i in range(num_layers) if d_model // (2**i) >= 4)
+            if not hidden_layers:
+                hidden_layers = (d_model, d_model//2)
+        
+        # Use MLPRegressor as transformer alternative - don't apply additional scaling
         self.model = MLPRegressor(
-            hidden_layer_sizes=(d_model, d_model//2, d_model//4),
+            hidden_layer_sizes=hidden_layers,
             activation='relu',
             solver='adam',
             max_iter=1000,
             random_state=42
         )
-        self.scaler = StandardScaler()
     
     def fit(self, X, y):
-        X_scaled = self.scaler.fit_transform(X)
-        self.model.fit(X_scaled, y)
+        # X is already scaled in train_and_predict_model, don't scale again
+        self.model.fit(X, y)
     
     def predict(self, X):
-        X_scaled = self.scaler.transform(X)
-        return self.model.predict(X_scaled)
+        # X is already scaled in train_and_predict_model, don't scale again
+        return self.model.predict(X)
 
 # Utility to ensure prediction is always a list
 def ensure_list(pred):
@@ -1534,7 +1574,7 @@ def ensure_list(pred):
 
 def train_and_predict_model(X, y, model_id):
     """Train actual ML model and make prediction, with feature scaling."""
-    if len(X) < 50:
+    if len(X) < MIN_DATA_POINTS:
         print(f"[train_and_predict_model] Not enough data for model {model_id}: {len(X)} samples")
         return [0.0]
     
@@ -1640,7 +1680,6 @@ def train_and_predict_model(X, y, model_id):
             model = AdaBoostRegressor(
                 n_estimators=80,   # Fewer estimators
                 learning_rate=0.05,  # Lower learning rate
-                loss='linear',
                 random_state=42
             )
         elif model_id == 6:  # Bayesian Ridge - More regularized
@@ -1685,7 +1724,10 @@ def train_and_predict_model(X, y, model_id):
         
         try:
             # Use TimeSeriesSplit for financial data (respects temporal order)
-            tscv = TimeSeriesSplit(n_splits=min(5, len(X_train_scaled)//10), test_size=max(10, len(X_train_scaled)//10))
+            # Ensure reasonable test size and number of splits
+            min_test_size = max(5, len(X_train_scaled)//20)  # At least 5, or 5% of data
+            max_splits = min(3, len(X_train_scaled)//min_test_size//2)  # Conservative splits
+            tscv = TimeSeriesSplit(n_splits=max(1, max_splits), test_size=min_test_size)
             
             # Perform cross-validation to assess model quality
             cv_scores = cross_val_score(model, X_train_scaled, y_train_clean, cv=tscv, scoring='neg_mean_squared_error')
@@ -1695,8 +1737,9 @@ def train_and_predict_model(X, y, model_id):
             print(f"[train_and_predict_model] Model {model_id} CV Score: {cv_mean:.6f} ± {cv_std:.6f}")
             
             # Skip models with very poor cross-validation performance
-            if cv_mean < -0.01:  # If MSE is very high (>1% error), skip this model
-                print(f"[train_and_predict_model] Model {model_id} has poor CV performance, skipping")
+            # Relaxed threshold: financial returns have naturally high variance
+            if cv_mean < -0.1:  # If MSE is extremely high (>10% error), skip this model
+                print(f"[train_and_predict_model] Model {model_id} has extremely poor CV performance, skipping")
                 return [0.0]
                 
         except Exception as e:
@@ -1715,46 +1758,28 @@ def train_and_predict_model(X, y, model_id):
             if len(predictions) == len(y_test):
                 prediction_bias = np.mean(predictions) - np.mean(y_test)
                 
-                # Apply bias correction to reduce systematic errors
-                calibrated_predictions = [p - prediction_bias for p in predictions]
+                # 🚨 CRITICAL FIX: Don't return test predictions!
+                # Instead, predict on the LAST training sample with bias correction
+                last_sample = X_train_scaled[-1:]
+                latest_prediction = model.predict(last_sample)[0]
                 
-                # Also apply shrinkage towards zero to reduce overconfidence
-                shrinkage_factor = 0.7  # Conservative shrinkage
-                final_predictions = [p * shrinkage_factor for p in calibrated_predictions]
+                # Apply bias correction to the latest prediction
+                corrected_prediction = latest_prediction - prediction_bias
                 
-                # Apply bounds checking to individual predictions
-                validated_predictions = []
-                for i, pred in enumerate(final_predictions):
-                    validated_pred, warnings = validate_prediction_bounds(pred, f"Model_{model_id}", strict_mode=False)
-                    validated_predictions.append(validated_pred)
-                    if warnings and i < 3:  # Only log warnings for first 3 predictions to avoid spam
-                        print(f"[train_and_predict_model] Model {model_id} prediction {i}: {warnings[0] if warnings else 'OK'}")
-                
-                print(f"[train_and_predict_model] Model {model_id} bias correction: {prediction_bias:.6f}, validated predictions: {validated_predictions[-3:]}")
-                return validated_predictions
+                print(f"[train_and_predict_model] Model {model_id} bias correction: {prediction_bias:.6f}")
+                print(f"[train_and_predict_model] Model {model_id} raw latest: {latest_prediction:.6f}, corrected: {corrected_prediction:.6f}")
+                return [corrected_prediction]
             else:
-                # Just apply shrinkage if we can't calculate bias
-                shrinkage_factor = 0.7
-                final_predictions = [p * shrinkage_factor for p in predictions]
-                
-                # Apply bounds checking to individual predictions
-                validated_predictions = []
-                for pred in final_predictions:
-                    validated_pred, warnings = validate_prediction_bounds(pred, f"Model_{model_id}", strict_mode=False)
-                    validated_predictions.append(validated_pred)
-                
-                return validated_predictions
+                # Fallback: predict on last sample without bias correction
+                last_sample = X_train_scaled[-1:]
+                prediction = model.predict(last_sample)[0]
+                return [prediction]
             
         else:
             # If no test data, predict on last training sample
             last_sample = X_train_scaled[-1:] 
             prediction = model.predict(last_sample)
             pred_list = ensure_iterable(prediction).tolist()
-            
-            # Apply bounds checking to single prediction
-            if pred_list:
-                validated_pred, warnings = validate_prediction_bounds(pred_list[0], f"Model_{model_id}", strict_mode=False)
-                pred_list = [validated_pred]
             
             print(f"[train_and_predict_model] Model {model_id} single prediction: {pred_list}")
             return pred_list
@@ -1765,11 +1790,11 @@ def train_and_predict_model(X, y, model_id):
         traceback.print_exc()
         return [0.0]
 
-def train_models_parallel(stock_data, model_ids, regime=None, regime_strength=0.5):
+def train_models_parallel(stock_data, model_ids, regime=None, regime_strength=0.5, prediction_window=5):
     """Train models for all stocks using parallel processing, with regime-aware feature weighting."""
     with ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
         future_to_ticker = {
-            executor.submit(train_model_for_stock, ticker, df, model_ids, regime, regime_strength): ticker 
+            executor.submit(train_model_for_stock, ticker, df, model_ids, regime, regime_strength, prediction_window): ticker 
             for ticker, df in stock_data.items()
         }
         
@@ -1787,7 +1812,7 @@ def train_models_parallel(stock_data, model_ids, regime=None, regime_strength=0.
 
 def simulate_prediction_model(df, model_id, prediction_window, confidence_interval):
     """Simulate prediction using different model types"""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < MIN_DATA_POINTS:
         return None, None, None
     # Calculate all technical indicators
     df = add_features_to_stock('TICKER', df, prediction_window)
@@ -1947,15 +1972,15 @@ def add_features_single(ticker, df, prediction_window=5, market_data_cache=None)
     """Add features to a single ticker's data (no parallelization)."""
     return add_features_to_stock(ticker, df, prediction_window, market_data_cache)
 
-def train_model_single(df, model_ids, regime=None, regime_strength=0.5):
+def train_model_single(df, model_ids, regime=None, regime_strength=0.5, prediction_window=5):
     """Train models for a single ticker (no parallelization) with bounds checking."""
-    if df is None or len(df) < 50:
+    if df is None or len(df) < MIN_DATA_POINTS:
         print(f"[train_model_single] DataFrame too short or None")
         return None
     
     try:
         # Use the same logic as train_model_for_stock but for single ticker
-        return train_model_for_stock("SINGLE_TICKER", df, model_ids, regime, regime_strength)
+        return train_model_for_stock("SINGLE_TICKER", df, model_ids, regime, regime_strength, prediction_window)
         
     except Exception as e:
         print(f"[train_model_single] ERROR: {e}")
@@ -2091,14 +2116,15 @@ def predict():
             else:
                 print(f"[predict] Single ticker user-selected models: {selected_models}")
             
+            print(f"[predict] 🎯 User requested {prediction_window}-day prediction window")
             print(f"[predict] Final selected_models for single ticker: {selected_models}")
             df = download_single_ticker_data(ticker_to_analyze, start_date)
-            if df is None or df.empty or len(df) < 50:
+            if df is None or df.empty or len(df) < MIN_DATA_POINTS:
                 return jsonify({'error': f'❌ Could not fetch data for {ticker_to_analyze}. Please check the ticker symbol and try again.'}), 400
             features_df = add_features_to_stock(ticker_to_analyze, df, prediction_window, market_data_cache)
             if features_df is None or features_df.empty:
                 return jsonify({'error': '❌ Could not process technical indicators. Data may be corrupted or insufficient.'}), 400
-            model_preds = train_model_single(features_df, selected_models, market_condition, market_strength)
+            model_preds = train_model_single(features_df, selected_models, market_condition, market_strength, prediction_window)
             if not model_preds:
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
             # Use improved confidence interval calculation for single ticker
@@ -2158,8 +2184,9 @@ def predict():
                 selected_models = select_models_for_market(market_condition, is_custom)
             elif not selected_models:
                 selected_models = [2, 7, 6]
+            print(f"🎯 User requested {prediction_window}-day prediction window for {len(processed_data)} stocks")
             print("Training models and generating predictions...")
-            trained_models = train_models_parallel(processed_data, selected_models, market_condition, market_strength)
+            trained_models = train_models_parallel(processed_data, selected_models, market_condition, market_strength, prediction_window)
             if not trained_models:
                 print(f"ERROR: Could not train models")
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
