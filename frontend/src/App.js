@@ -1,6 +1,6 @@
 // --- Imports ---
 import React, { useState, useEffect, useRef } from 'react';
-import { ChevronDown, Calendar, TrendingUp, Settings, Play, Info, AlertCircle, CheckCircle, Brain, Target } from 'lucide-react';
+import { ChevronDown, Calendar, TrendingUp, Settings, Play, Info, AlertCircle, CheckCircle, Brain, Target, MessageSquare, Newspaper, Building } from 'lucide-react';
 import ReactDOM from 'react-dom';
 
 // --- Main App Component ---
@@ -669,6 +669,259 @@ const StockPredictionApp = () => {
                     {loading ? 'Predicting...' : 'Run Prediction'}
                   </button>
                 </form>
+
+                {/* Sentiment Analysis Box for All Tickers (Custom and Indexes) */}
+                {results && results.sentiment_analysis && (
+                  <div className="mt-6 bg-white/12 backdrop-blur-lg rounded-3xl p-6 border border-white/20">
+                    <h3 className="text-xl font-bold text-white mb-4 text-center flex items-center justify-center relative">
+                      <MessageSquare className="mr-2 text-blue-400" />
+                      Sentiment Analysis
+                      <span
+                        ref={el => (iconRefs.current['sentiment-analysis'] = el)}
+                        className="ml-2 cursor-pointer absolute right-0 top-0"
+                        onClick={e => {
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          setTooltipPos({
+                            top: rect.bottom + window.scrollY + 8,
+                            left: rect.left + window.scrollX + rect.width / 2
+                          });
+                          setOpenTooltip(openTooltip === 'sentiment-analysis' ? null : 'sentiment-analysis');
+                        }}
+                        tabIndex={0}
+                        aria-label="Sentiment Analysis Info"
+                      >
+                        <Info className="text-blue-400 w-4 h-4" />
+                      </span>
+                      {openTooltip === 'sentiment-analysis' && ReactDOM.createPortal(
+                        <div
+                          id="sentiment-tooltip"
+                          className="z-[9999] w-80 p-3 bg-gray-800 text-white text-xs rounded shadow-lg border border-blue-400"
+                          style={{ position: 'absolute', top: tooltipPos.top, left: tooltipPos.left, transform: 'translate(-50%, 0)' }}
+                        >
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="font-bold text-blue-300">Sentiment Analysis</span>
+                            <button className="text-white text-lg ml-2" onClick={() => setOpenTooltip(null)}>&times;</button>
+                          </div>
+                          <div>
+                            {results.sentiment_analysis.sentiment_details?.is_index ? (
+                              <>
+                                <b>Index Sentiment Analysis</b> with <b>index-specific news</b>:<br/>
+                                • <b>Index News (70%)</b>: Articles specifically about the index (e.g., "Dow Jones", "S&P 500", "NASDAQ")<br/>
+                                • <b>Market Sentiment (30%)</b>: Overall market conditions from major indices<br/><br/>
+                                <b>Search Terms:</b> For indexes like DOW, we search for "Dow Jones", "DJIA", "Industrial Average", etc. to find relevant news.<br/><br/>
+                                <b>Impact:</b> Index sentiment combines specific index coverage with broader market conditions to provide comprehensive sentiment analysis.
+                              </>
+                            ) : (
+                              <>
+                                <b>Real-time sentiment</b> analysis with <b>dynamic weighting</b>:<br/>
+                                • <b>Company News (Base: 50%)</b>: Recent news specific to this stock<br/>
+                                • <b>Sector News (Base: 20%)</b>: News affecting the company's industry<br/>
+                                • <b>Market News (Base: 30%)</b>: Overall market sentiment from major indices<br/><br/>
+                                <b>Dynamic Weighting:</b> When company or sector news is unavailable, their weights are redistributed proportionally to available sources, ensuring market news gets more influence when specific news is missing.<br/><br/>
+                                <b>Impact:</b> Strong sentiment can change the direction of technical predictions, helping identify when news sentiment might override technical signals.
+                              </>
+                            )}
+                          </div>
+                        </div>,
+                        document.body
+                      )}
+                    </h3>
+                    
+                    <div className={`grid ${results.sentiment_analysis.sentiment_details?.is_index ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1 md:grid-cols-3'} gap-4`}>
+                      {/* Overall Sentiment Score */}
+                      <div className="bg-white/5 rounded-xl p-4 border border-white/10 text-center">
+                        <div className="flex items-center justify-center mb-2">
+                          <Target className="mr-2 text-purple-400" size={20} />
+                          <span className="text-sm font-medium text-gray-300">Overall Score</span>
+                        </div>
+                        <div className={`text-2xl font-bold ${
+                          results.sentiment_analysis.sentiment_score > 20 ? 'text-green-400' :
+                          results.sentiment_analysis.sentiment_score < -20 ? 'text-red-400' :
+                          'text-yellow-400'
+                        }`}>
+                          {results.sentiment_analysis.sentiment_score > 0 ? '+' : ''}{Math.round(results.sentiment_analysis.sentiment_score)}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-1">
+                          {results.sentiment_analysis.sentiment_score > 20 ? 'Bullish' :
+                           results.sentiment_analysis.sentiment_score < -20 ? 'Bearish' :
+                           'Neutral'}
+                        </div>
+                        <div className="w-full bg-gray-700 rounded-full h-2 mt-2">
+                          <div 
+                            className={`h-2 rounded-full ${
+                              results.sentiment_analysis.sentiment_score > 0 ? 'bg-green-400' : 'bg-red-400'
+                            }`}
+                            style={{ 
+                              width: `${Math.min(Math.abs(results.sentiment_analysis.sentiment_score), 100)}%`,
+                              marginLeft: results.sentiment_analysis.sentiment_score < 0 ? 
+                                `${100 - Math.min(Math.abs(results.sentiment_analysis.sentiment_score), 100)}%` : '0'
+                            }}
+                          ></div>
+                        </div>
+                      </div>
+
+                      {/* Conditional display based on whether it's an index or single ticker */}
+                      {results.sentiment_analysis.sentiment_details?.is_index ? (
+                        /* Index: Only show Market Analysis */
+                        <div className="bg-white/5 rounded-xl p-4 border border-white/10 text-center">
+                          <div className="flex items-center justify-center mb-2">
+                            <Newspaper className="mr-2 text-green-400" size={20} />
+                            <span className="text-sm font-medium text-gray-300">Market Analysis</span>
+                          </div>
+                          <div className="text-lg font-semibold text-white">
+                            <span className={`${
+                              results.sentiment_analysis.sentiment_details?.market_sentiment > 0 ? 'text-green-400' : 
+                              results.sentiment_analysis.sentiment_details?.market_sentiment < 0 ? 'text-red-400' : 
+                              'text-yellow-400'
+                            }`}>
+                              {Math.round(results.sentiment_analysis.sentiment_details?.market_sentiment || 0)}
+                            </span>
+                          </div>
+                          <div className="text-xs text-gray-400">Technical Indicators</div>
+                          <div className="text-xs text-green-300 mt-1">
+                            100% Weight (Market Only)
+                          </div>
+                        </div>
+                      ) : (
+                        /* Single Ticker: Show Company and Sector & Market */
+                        <>
+                          {/* Company News */}
+                          <div className="bg-white/5 rounded-xl p-4 border border-white/10 text-center">
+                            <div className="flex items-center justify-center mb-2">
+                              <Building className="mr-2 text-blue-400" size={20} />
+                              <span className="text-sm font-medium text-gray-300">
+                                {results.sentiment_analysis.sentiment_details?.is_index ? 'Index' : 'Company'}
+                              </span>
+                            </div>
+                            <div className="text-lg font-semibold text-white">
+                              <span className={`${
+                                results.sentiment_analysis.sentiment_details?.company_sentiment_score > 0 ? 'text-green-400' : 
+                                results.sentiment_analysis.sentiment_details?.company_sentiment_score < 0 ? 'text-red-400' : 
+                                'text-yellow-400'
+                              }`}>
+                                {results.sentiment_analysis.sentiment_details?.company_sentiment_score > 0 ? '+' : ''}
+                                {Math.round(results.sentiment_analysis.sentiment_details?.company_sentiment_score || 0)}
+                              </span>
+                            </div>
+                            <div className="text-xs text-gray-400">Sentiment Score</div>
+                            <div className="text-xs text-blue-300 mt-1">
+                              {results.sentiment_analysis.sentiment_details?.has_company_news ? 
+                                `${Math.round((results.sentiment_analysis.sentiment_details?.company_weight || 0) * 100)}% Weight` : 
+                                'No News (0%)'
+                              }
+                            </div>
+                            <div className="text-xs text-gray-400 mt-1">
+                              {results.sentiment_analysis.sentiment_details?.company_articles || 0} {results.sentiment_analysis.sentiment_details?.is_index ? 'index' : ''} articles analyzed
+                            </div>
+                          </div>
+
+                          {/* Sector & Market (or just Market for indexes) */}
+                          <div className="bg-white/5 rounded-xl p-4 border border-white/10 text-center">
+                            <div className="flex items-center justify-center mb-2">
+                              <Newspaper className="mr-2 text-green-400" size={20} />
+                              <span className="text-sm font-medium text-gray-300">
+                                {results.sentiment_analysis.sentiment_details?.is_index ? 'Market' : 'Sector & Market'}
+                              </span>
+                            </div>
+                            <div className="text-sm text-white">
+                              {results.sentiment_analysis.sentiment_details?.is_index ? (
+                                /* Index: Show only Market sentiment */
+                                <div className="flex justify-between">
+                                  <span>Market:</span>
+                                  <span className={`${
+                                    results.sentiment_analysis.sentiment_details?.market_sentiment > 0 ? 'text-green-400' : 
+                                    results.sentiment_analysis.sentiment_details?.market_sentiment < 0 ? 'text-red-400' : 
+                                    'text-yellow-400'
+                                  }`}>
+                                    {results.sentiment_analysis.sentiment_details?.market_sentiment > 0 ? '+' : ''}
+                                    {Math.round(results.sentiment_analysis.sentiment_details?.market_sentiment || 0)}
+                                  </span>
+                                </div>
+                              ) : (
+                                /* Single Ticker: Show both Sector and Market */
+                                <>
+                                  <div className="flex justify-between">
+                                    <span>Sector:</span>
+                                    <span className={`${
+                                      results.sentiment_analysis.sentiment_details?.sector_sentiment_score > 0 ? 'text-green-400' : 
+                                      results.sentiment_analysis.sentiment_details?.sector_sentiment_score < 0 ? 'text-red-400' : 
+                                      'text-yellow-400'
+                                    }`}>
+                                      {results.sentiment_analysis.sentiment_details?.sector_sentiment_score > 0 ? '+' : ''}
+                                      {Math.round(results.sentiment_analysis.sentiment_details?.sector_sentiment_score || 0)}
+                                    </span>
+                                  </div>
+                                  <div className="flex justify-between">
+                                    <span>Market:</span>
+                                    <span className={`${
+                                      results.sentiment_analysis.sentiment_details?.market_sentiment > 0 ? 'text-green-400' : 
+                                      results.sentiment_analysis.sentiment_details?.market_sentiment < 0 ? 'text-red-400' : 
+                                      'text-yellow-400'
+                                    }`}>
+                                      {results.sentiment_analysis.sentiment_details?.market_sentiment > 0 ? '+' : ''}
+                                      {Math.round(results.sentiment_analysis.sentiment_details?.market_sentiment || 0)}
+                                    </span>
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                            <div className="text-xs text-gray-400 mt-1">
+                              {results.sentiment_analysis.sentiment_details?.is_index ? (
+                                /* Index: Show only market weight */
+                                `Market: ${Math.round((results.sentiment_analysis.sentiment_details?.market_weight || 0) * 100)}%`
+                              ) : (
+                                /* Single Ticker: Show sector + market weights */
+                                `Sector: ${Math.round((results.sentiment_analysis.sentiment_details?.sector_weight || 0) * 100)}% + Market: ${Math.round((results.sentiment_analysis.sentiment_details?.market_weight || 0) * 100)}%`
+                              )}
+                            </div>
+                            {!results.sentiment_analysis.sentiment_details?.is_index && (
+                              <div className="text-xs text-gray-400 mt-1">
+                                {results.sentiment_analysis.sentiment_details?.sector_articles || 0} sector articles analyzed
+                              </div>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+
+                    {/* Sector Information - Only show for non-indexes */}
+                    {results.sentiment_analysis.sentiment_details?.sector && 
+                     !results.sentiment_analysis.sentiment_details?.is_index && (
+                      <div className="mt-4 text-center">
+                        <span className="text-sm text-gray-300">Industry: </span>
+                        <span className="text-sm font-medium text-blue-300">
+                          {results.sentiment_analysis.sentiment_details.sector}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Prediction Impact - Now shows for both single tickers and indexes */}
+                    {results.sentiment_analysis.original_ml_prediction !== undefined && (
+                      <div className="mt-4 p-3 bg-white/5 rounded-lg border border-white/10">
+                        <div className="text-sm text-gray-300 text-center mb-2">Sentiment Impact on Prediction</div>
+                        <div className="flex justify-center items-center space-x-4 text-sm">
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400">ML Only</div>
+                            <div className="font-medium text-blue-300">
+                              {(results.sentiment_analysis.original_ml_prediction * 100).toFixed(2)}%
+                            </div>
+                          </div>
+                          <div className="text-gray-400">→</div>
+                          <div className="text-center">
+                            <div className="text-xs text-gray-400">With Sentiment</div>
+                            <div className={`font-medium ${
+                              results.index_prediction.pred > results.sentiment_analysis.original_ml_prediction ? 'text-green-400' :
+                              results.index_prediction.pred < results.sentiment_analysis.original_ml_prediction ? 'text-red-400' :
+                              'text-yellow-400'
+                            }`}>
+                              {(results.index_prediction.pred * 100).toFixed(2)}%
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {error && (
                   <div className="mt-4 p-6 bg-red-500/20 border border-red-500/30 rounded-xl">
