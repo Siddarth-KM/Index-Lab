@@ -3210,8 +3210,8 @@ def analyze_ticker_sentiment(ticker):
                 f"({sentiment_data.get('index_articles', 0)} articles), Final={sentiment_score:.1f}")
         else:
             sentiment_details = {
-                'company_sentiment': sentiment_data.get('company_sentiment_score', 0.0),
-                'sector_sentiment': sentiment_data.get('sector_sentiment_score', 0.0),
+                'company_sentiment_score': sentiment_data.get('company_sentiment_score', 0.0),
+                'sector_sentiment_score': sentiment_data.get('sector_sentiment_score', 0.0),
                 'market_sentiment': sentiment_data.get('market_sentiment', 0.0),
                 # Use dynamic weights that were actually applied
                 'company_weight': sentiment_data.get('dynamic_company_weight', 0),
