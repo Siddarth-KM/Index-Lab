@@ -1,57 +1,63 @@
+# ============================================================================
+# IMPORTS SECTION
+# ============================================================================
+
+# Standard Library Imports
+import base64
+import io
+import json
+import logging
+import os
+import pickle
+import random
+import re
+import time
+import traceback
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from threading import Lock
+
+# Third-Party Imports
+import matplotlib
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import yfinance as yf
+from bs4 import BeautifulSoup
+from bs4.element import Tag
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import matplotlib.pyplot as plt
-import matplotlib
+from scipy import stats
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+
+# Machine Learning Imports
+import xgboost as xgb
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, AdaBoostRegressor
+from sklearn.linear_model import BayesianRidge, ElasticNet
+from sklearn.model_selection import cross_val_score, TimeSeriesSplit
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.svm import SVR
+
+# Technical Analysis Imports
+from ta.momentum import RSIIndicator, ROCIndicator, WilliamsRIndicator, StochasticOscillator
+from ta.trend import EMAIndicator, IchimokuIndicator, MACD
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, AccDistIndexIndicator
+
+# Configure environment and warnings
 matplotlib.use('Agg')  # Use non-interactive backend
-import io
-import base64
-from datetime import datetime, timedelta
-import warnings
-import requests
-import time
-import os
-import torch
-import json
-import pickle
-import traceback
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
-import logging
-# Suppress all warnings and verbose output
 warnings.filterwarnings('ignore')
 logging.getLogger().setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("yfinance").setLevel(logging.ERROR)
-# Suppress HuggingFace progress bars
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-from ta.trend import EMAIndicator
-from ta.trend import IchimokuIndicator
-from ta.momentum import RSIIndicator, ROCIndicator
-from ta.trend import MACD
-from ta.volatility import AverageTrueRange
-from ta.volume import OnBalanceVolumeIndicator
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, AdaBoostRegressor
-from sklearn.linear_model import BayesianRidge, ElasticNet
-from sklearn.svm import SVR
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-import xgboost as xgb
-import matplotlib.cm as cm
-from ta.momentum import WilliamsRIndicator, StochasticOscillator
-from ta.volatility import BollingerBands
-from ta.volume import ChaikinMoneyFlowIndicator, AccDistIndexIndicator
-from bs4 import BeautifulSoup
-from bs4.element import Tag
-from scipy import stats
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
-import re
-import time
 app = Flask(__name__)
 CORS(app)
 
@@ -98,8 +104,8 @@ MARKET_SYMBOLS = ['SPY', 'VIX', 'DXY', 'TLT', 'GLD', 'QQQ']
 # Sentiment Analysis Constants
 SENTIMENT_CONFIG = {
     'ALPHA_VANTAGE_API_KEY': '4AOTSWIKBYTLSJT4',  # 🔑 Your real Alpha Vantage API key
-    'COMPANY_NEWS_WEIGHT': 0.5,    # Reduced to make room for market sentiment
-    'SECTOR_NEWS_WEIGHT': 0.2,     # Reduced to make room for market sentiment  
+    'COMPANY_NEWS_WEIGHT': 0.5,    # Weight for company-specific news sentiment
+    'SECTOR_NEWS_WEIGHT': 0.2,     # Weight for sector news sentiment  
     'MARKET_NEWS_WEIGHT': 0.3,     # New: Global market sentiment weight
     'NEWS_LOOKBACK_DAYS': 7,
     'SENTIMENT_CACHE_HOURS': 1,
@@ -716,7 +722,7 @@ def get_index_sentiment_score(index_name):
         # Get global market sentiment (cached for 24 hours)
         market_sentiment = get_market_sentiment()
         
-        # 🚀 FOR INDEXES: Skip all Alpha Vantage API calls and use only market sentiment
+        # For index tickers, use market sentiment only to avoid API calls
         # This avoids unnecessary API usage and potential rate limits for index analysis
         print(f"[get_index_sentiment_score] 📈 {index_name}: Using market sentiment only (no news API calls)")
         
@@ -729,7 +735,7 @@ def get_index_sentiment_score(index_name):
         final_sentiment = 0.0
         has_index_news = False  # Never have index news since we skip API calls
         
-        # 🚀 FOR INDEXES: Always use 100% market sentiment (no news mixing)
+        # For indexes, use 100% market sentiment without mixing news data
         final_sentiment = market_sentiment
         index_weight = 0.0
         market_weight = 1.0
@@ -1007,7 +1013,7 @@ def get_sentiment_score(ticker):
             'timestamp': time.time()
         }
 
-# --- Improved Confidence Interval Calculations ---
+# --- Confidence Interval Calculations ---
 def calculate_proper_confidence_interval(predictions, confidence_level=DEFAULT_CONFIDENCE_LEVEL, base_volatility=0.02):
     """
     Calculate proper confidence intervals based on model ensemble variance
@@ -1407,8 +1413,6 @@ def scrape_index_constituents(index_name, force_refresh=False):
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        from bs4 import BeautifulSoup
-        import re
         soup = BeautifulSoup(response.content, 'html.parser')
         blacklist = {'THE', 'AND', 'FOR', 'INC', 'LTD', 'CORP', 'CO', 'LLC', 'ETF', 'PLC', 'GROUP', 'CLASS', 'FUND', 'TRUST', 'HOLDINGS', 'COMPANY', 'CORPORATION', 'LIMITED', 'NYSE', 'NASDAQ', 'NASDA'}
         tables = soup.find_all('table', class_='wikitable')
@@ -1537,7 +1541,6 @@ def download_index_data(index_name, start_date, force_refresh=False):
         fallback_to_threadpool = False
         if df is None or df.empty or (len(tickers) > 1 and not isinstance(df.columns, pd.MultiIndex)):
             print("[download_index_data] Batch download failed or returned empty. Using ThreadPoolExecutor for per-ticker download.")
-            from concurrent.futures import ThreadPoolExecutor, as_completed
             def fetch_ticker(ticker):
                 try:
                     tdf = yf.download(ticker, start=start_date, end=end_date, progress=False)
@@ -1660,7 +1663,6 @@ def detect_market_regime(etf_df):
         df['macd_signal'] = flatten_series(macd_signal_raw)
         df['ema_diff'] = flatten_series(df['macd'] - df['macd_signal'])
     if 'stoch_k' not in df:
-        from ta.momentum import StochasticOscillator
         stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'])
         df['stoch_k'] = flatten_series(stoch.stoch())
     if 'Donchian_Width' not in df:
@@ -1668,7 +1670,6 @@ def detect_market_regime(etf_df):
     if 'RSI' not in df:
         df['RSI'] = flatten_series(RSIIndicator(close=df['Close']).rsi())
     if 'williams_r' not in df:
-        from ta.momentum import WilliamsRIndicator
         df['williams_r'] = flatten_series(WilliamsRIndicator(high=df['High'], low=df['Low'], close=df['Close'], lbp=14).williams_r())
     if 'ATR' not in df:
         df['ATR'] = flatten_series(AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close']).average_true_range())
@@ -1681,7 +1682,6 @@ def detect_market_regime(etf_df):
     if 'OBV' not in df:
         df['OBV'] = flatten_series(OnBalanceVolumeIndicator(close=df['Close'], volume=df['Volume']).on_balance_volume())
     if 'cmf' not in df:
-        from ta.volume import ChaikinMoneyFlowIndicator
         df['cmf'] = flatten_series(ChaikinMoneyFlowIndicator(high=df['High'], low=df['Low'], close=df['Close'], volume=df['Volume']).chaikin_money_flow())
     recent = df.tail(30)
     # --- Trend ---
@@ -1751,7 +1751,7 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         # Create a copy to avoid warnings
         df = df.copy()
         
-        # Enhanced handling of nested arrays in input data
+        # Handle nested arrays in input data
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col in df.columns:
                 series = df[col]
@@ -1905,7 +1905,7 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         return None
 
 def add_features_to_stock(ticker, df, prediction_window=5, market_data_cache=None):
-    """Enhanced version with cross-asset features"""
+    """Version with cross-asset features"""
     if df is None or len(df) < MIN_DATA_POINTS:
         print(f"[add_features_to_stock] {ticker}: DataFrame too short or None")
         return None
@@ -2062,11 +2062,11 @@ def add_cross_asset_features(df, ticker, market_data_cache):
                 
                 calculated_features.extend(['qqq_spy_ratio', 'tech_outperform'])
         
-        # Enhanced Time-Based Features - FIXED: Use pandas built-in properties
+        # Time-based features using pandas built-in properties
         df['day_of_week'] = df.index.dayofweek
         df['month'] = df.index.month
         df['quarter'] = df.index.quarter
-        # Fix for quarter_end detection using built-in property
+        # Quarter end detection using built-in property
         df['is_quarter_end'] = df.index.is_quarter_end.astype(int)
         df['is_friday'] = (df.index.dayofweek == 4).astype(int)
         df['is_monday'] = (df.index.dayofweek == 0).astype(int)
@@ -2143,14 +2143,14 @@ def add_features_parallel(stock_data, prediction_window=5, market_data_cache=Non
 
 def get_indicator_weights(regime, regime_strength):
     """Return a dict of feature weights based on regime and regime strength."""
-    # Define base weights for each group per regime - updated with cross_asset group
+    # Define base weights for each group per regime - includes cross_asset group
     base_weights = {
         'bull': {'momentum': 1.3, 'trend': 1.2, 'mean_reversion': 0.8, 'volatility': 0.7, 'volume': 1.0, 'cross_asset': 1.1, 'other': 1.0},
         'bear': {'momentum': 0.8, 'trend': 0.7, 'mean_reversion': 1.3, 'volatility': 1.2, 'volume': 1.0, 'cross_asset': 1.2, 'other': 1.0},
         'sideways': {'momentum': 0.8, 'trend': 0.8, 'mean_reversion': 1.3, 'volatility': 1.0, 'volume': 1.0, 'cross_asset': 0.9, 'other': 1.0},
         'volatile': {'momentum': 0.7, 'trend': 0.7, 'mean_reversion': 1.1, 'volatility': 1.3, 'volume': 1.2, 'cross_asset': 1.3, 'other': 1.0},
     }
-    # Map each feature to a group - updated with cross-asset features
+    # Map each feature to a group - includes cross-asset features
     group_map = {
         # Momentum
         'RSI': 'momentum', 'roc_10': 'momentum', 'momentum': 'momentum', 'rsi_14_diff': 'momentum', 'williams_r': 'momentum', 'stoch_k': 'momentum',
@@ -2178,7 +2178,7 @@ def get_indicator_weights(regime, regime_strength):
         'rising_rates': 'cross_asset',
         # 🗑️ REMOVED: 'strong_dollar': 'cross_asset'
         
-        # Enhanced time features - REMOVED is_month_end as requested
+        # Additional time-based features for model training
         'day_of_week': 'other', 'month': 'other', 'quarter': 'other', 
         'is_quarter_end': 'other', 'is_friday': 'other', 'is_monday': 'other'
     }
@@ -2209,7 +2209,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
         # Extract feature columns (exclude basic OHLCV)
         feature_columns = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']]
         
-        # Validate that we have meaningful features - ENHANCED CROSS-ASSET DETECTION
+        # Validate that we have meaningful features - cross-asset detection
         cross_asset_features = [col for col in feature_columns if any(keyword in col.lower() for keyword in 
                                ['spy', 'vix', 'dxy', 'tlt', 'gld', 'qqq', 'correlation', 'beta',
                                 'ratio', 'risk_on', 'risk_off', 'relative', 'sentiment',
@@ -2223,7 +2223,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
             print(f"[train_model_for_stock] {ticker}: Insufficient technical features ({len(technical_features)})")
             return None
         
-        # Clean and prepare features with improved missing data handling
+        # Clean and prepare features with missing data handling
         df_clean = df.copy()
         for col in feature_columns:
             if col in df_clean.columns:
@@ -2263,7 +2263,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
         
         print(f"[train_model_for_stock] {ticker}: Valid features - Technical: {len(valid_technical)}, Cross-asset: {len(valid_cross_asset)}")
         
-        # 🚨 ENHANCED FIX: Explicit cross-asset feature tracking and validation
+        # Track cross-asset feature availability for model performance assessment
         if len(valid_cross_asset) == 0:
             print(f"[train_model_for_stock] {ticker}: ⚠️ NO cross-asset features found - only technical indicators will be used")
         else:
@@ -2313,14 +2313,14 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
             
         X = df_clean[valid_features_filtered].values.astype(float)
         
-        # 🚨 ENHANCED FIX: Validate cross-asset features are actually in the final feature matrix
+        # Validate feature composition in final training matrix
         final_cross_asset = [col for col in valid_features_filtered if col in cross_asset_features]
         final_technical = [col for col in valid_features_filtered if col in technical_features]
         
         print(f"[train_model_for_stock] {ticker}: 📊 Final feature matrix - Technical: {len(final_technical)}, Cross-asset: {len(final_cross_asset)}")
         
         if len(final_cross_asset) == 0:
-            print(f"[train_model_for_stock] {ticker}: 🚨 WARNING: NO cross-asset features in final training matrix!")
+            print(f"[train_model_for_stock] {ticker}: WARNING: NO cross-asset features in final training matrix!")
         else:
             print(f"[train_model_for_stock] {ticker}: ✅ Cross-asset features in training: {final_cross_asset[:3]}{'...' if len(final_cross_asset) > 3 else ''}")
             
@@ -2389,7 +2389,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                     # NO SCALING - keep predictions in natural decimal scale
                     avg_pred = raw_pred
                     
-                    # 🚨 SAFETY CHECK: Filter out extreme individual predictions
+                    # Filter out extreme individual predictions to prevent ensemble contamination
                     # This prevents one bad model from poisoning the ensemble
                     max_reasonable_return = 0.25 if prediction_window == 1 else 0.50  # 25% daily, 50% weekly max
                     if abs(avg_pred) > max_reasonable_return:
@@ -2437,7 +2437,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                 # Use mean for ensemble (more responsive than median)
                 ensemble_pred = np.mean(valid_predictions)
                 
-                # 🚨 CRITICAL FIX: Apply global bounds checking for reasonable predictions
+                # Apply global bounds checking for reasonable predictions
                 # For 1-day predictions, cap at ±15% (realistic daily stock movement limits)
                 # For longer periods, allow larger movements
                 if prediction_window == 1:
@@ -2461,7 +2461,7 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
                 pred_std = np.std(valid_predictions) if len(valid_predictions) > 1 else 0.0
                 pred_spread = np.max(valid_predictions) - np.min(valid_predictions) if len(valid_predictions) > 1 else 0.0
                 
-                # Improved confidence calculation - less harsh, more realistic
+                # Confidence calculation based on prediction variance
                 # Typical stock returns have spreads of 0.01-0.05 (1-5%), so normalize accordingly
                 normalized_spread = pred_spread / 0.02  # Normalize to 2% spread = 1.0
                 confidence = max(0.2, 1.0 - (normalized_spread * 0.3))  # More gradual penalty
@@ -2517,7 +2517,6 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
         
     except Exception as e:
         print(f"[train_model_for_stock] ERROR for {ticker}: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
@@ -2575,14 +2574,14 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
         X = np.array(X)
         y = np.array(y)
         
-        # 🚨 ENHANCED FIX: Robust preprocessing for infinity and extreme values
+        # Robust preprocessing for infinity and extreme values
         print(f"[train_and_predict_model] Model {model_id} preprocessing: X shape={X.shape}, y shape={y.shape}")
         
         # Check for infinity values in features
         inf_mask_X = np.isinf(X)
         if np.any(inf_mask_X):
             inf_count = np.sum(inf_mask_X)
-            print(f"[train_and_predict_model] Model {model_id} 🚨 Found {inf_count} infinity values in features")
+            print(f"[train_and_predict_model] Model {model_id} Found {inf_count} infinity values in features")
             
             # Replace infinity with extreme but finite values
             X[X == np.inf] = 1e6   # Positive infinity
@@ -2593,7 +2592,7 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
         inf_mask_y = np.isinf(y)
         if np.any(inf_mask_y):
             inf_count_y = np.sum(inf_mask_y)
-            print(f"[train_and_predict_model] Model {model_id} 🚨 Found {inf_count_y} infinity values in targets")
+            print(f"[train_and_predict_model] Model {model_id} Found {inf_count_y} infinity values in targets")
             
             # Replace infinity with extreme but reasonable values for returns
             y[y == np.inf] = 0.5   # 50% return (extreme but possible)
@@ -2611,18 +2610,18 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
             X = np.clip(X, -extreme_threshold_X, extreme_threshold_X)
             print(f"[train_and_predict_model] Model {model_id} ✅ Extreme feature values capped to ±{extreme_threshold_X}")
         
-        # 🚨 ENHANCED FIX: Post-processing verification
+        # Post-processing verification of data cleaning
         # Verify that all infinity and extreme value replacements worked
         remaining_inf_X = np.sum(np.isinf(X))
         remaining_inf_y = np.sum(np.isinf(y))
         
         if remaining_inf_X > 0 or remaining_inf_y > 0:
-            print(f"[train_and_predict_model] Model {model_id} 🚨 ERROR: {remaining_inf_X} infinity values still in X, {remaining_inf_y} in y after preprocessing")
+            print(f"[train_and_predict_model] Model {model_id} ERROR: {remaining_inf_X} infinity values still in X, {remaining_inf_y} in y after preprocessing")
             return [0.0]
         
         remaining_extreme_X = np.sum(np.abs(X) > extreme_threshold_X)
         if remaining_extreme_X > 0:
-            print(f"[train_and_predict_model] Model {model_id} 🚨 ERROR: {remaining_extreme_X} extreme values still in X after clipping")
+            print(f"[train_and_predict_model] Model {model_id} ERROR: {remaining_extreme_X} extreme values still in X after clipping")
             return [0.0]
             
         print(f"[train_and_predict_model] Model {model_id} ✅ Data preprocessing verification passed")
@@ -2681,24 +2680,24 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
         if model_id == 1:  # XGBoost - More conservative
             model = xgb.XGBRegressor(
                 objective='reg:squarederror',
-                n_estimators=100,    # Reduced from 150
-                max_depth=3,         # Reduced from 4 for more conservative
-                learning_rate=0.02,  # Reduced from 0.03
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.02,
                 subsample=0.6,       # More aggressive subsampling
                 colsample_bytree=0.6,  # Use fewer features
-                reg_alpha=0.2,       # Increased L1 regularization
-                reg_lambda=0.2,      # Increased L2 regularization
+                reg_alpha=0.2,       # L1 regularization
+                reg_lambda=0.2,      # L2 regularization
                 random_state=42,
                 verbosity=0
             )
         elif model_id == 2:  # Random Forest - More conservative
             model = RandomForestRegressor(
-                n_estimators=100,  # Reduced from 150
-                max_depth=6,       # Reduced from 8
-                min_samples_split=15,  # Increased from 10
-                min_samples_leaf=8,    # Increased from 5
+                n_estimators=100,
+                max_depth=6,
+                min_samples_split=15,
+                min_samples_leaf=8,
                 bootstrap=True,
-                max_features=0.6,  # Reduced from 0.7
+                max_features=0.6,
                 random_state=42,
                 n_jobs=1
             )
@@ -2734,19 +2733,19 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
                 )
         elif model_id == 4:  # Extra Trees - More conservative
             model = ExtraTreesRegressor(
-                n_estimators=100,  # Reduced from 150
-                max_depth=6,       # Reduced from 8
-                min_samples_split=15,  # Increased from 10
-                min_samples_leaf=8,    # Increased from 5
+                n_estimators=100,
+                max_depth=6,
+                min_samples_split=15,
+                min_samples_leaf=8,
                 bootstrap=True,
-                max_features=0.6,  # Reduced from 0.7
+                max_features=0.6,
                 random_state=42,
                 n_jobs=1
             )
         elif model_id == 5:  # AdaBoost - Much more conservative due to instability
             model = AdaBoostRegressor(
-                n_estimators=30,   # Reduced from 50 to prevent overfitting
-                learning_rate=0.01,  # Reduced from 0.02 to make more stable
+                n_estimators=30,   # Conservative setting to prevent overfitting
+                learning_rate=0.01,  # Low learning rate for stability
                 random_state=42
             )
         elif model_id == 6:  # Bayesian Ridge - More regularized
@@ -2761,24 +2760,24 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
         elif model_id == 7:  # SVR - More conservative
             model = SVR(
                 kernel='rbf',
-                C=1.0,      # Reduced from 10.0 for less complexity
-                epsilon=0.01,  # Reduced from 0.1 for tighter fit
+                C=1.0,      # Regularization parameter for complexity control
+                epsilon=0.01,  # Tolerance for tight fitting
                 gamma='scale'
             )
         elif model_id == 8:  # Gradient Boosting - Much more conservative due to instability
             model = GradientBoostingRegressor(
-                n_estimators=50,   # Reduced from 80 to prevent overfitting
-                learning_rate=0.02,  # Reduced from 0.05 for stability
-                max_depth=3,       # Reduced from 4 for simpler trees
-                subsample=0.6,     # Reduced from 0.7 to add more randomness
+                n_estimators=50,   # Moderate ensemble size to prevent overfitting
+                learning_rate=0.02,  # Conservative learning rate for stability
+                max_depth=3,       # Shallow trees for simpler models
+                subsample=0.6,     # Reduced sampling for additional randomness
                 random_state=42
             )
         elif model_id == 9:  # Elastic Net - More regularized
             model = ElasticNet(
-                alpha=0.2,     # Increased from 0.1 for more regularization
+                alpha=0.2,     # L1 regularization strength
                 l1_ratio=0.5,
                 random_state=42,
-                max_iter=3000  # Increased from 2000
+                max_iter=3000  # Maximum iterations for convergence
             )
         elif model_id == 10:  # Transformer-like
             model = TransformerModel(input_dim=X_train_scaled.shape[1])
@@ -2787,7 +2786,6 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
             return [0.0]
         
         # Add cross-validation for better accuracy assessment
-        from sklearn.model_selection import cross_val_score, TimeSeriesSplit
         
         try:
             # Use TimeSeriesSplit for financial data (respects temporal order)
@@ -2849,7 +2847,7 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
             if len(predictions) == len(y_test) and len(predictions) >= 3:  # Need at least 3 samples for reliable bias
                 prediction_bias = np.mean(predictions) - np.mean(y_test)
                 
-                # 🚨 ENHANCED FIX: Much more conservative bias correction with reliability check
+                # Conservative bias correction with reliability check
                 # Only apply bias correction if it's statistically significant and reasonable
                 prediction_std = np.std(predictions) if len(predictions) > 1 else 0.01
                 target_std = np.std(y_test) if len(y_test) > 1 else 0.01
@@ -2862,9 +2860,9 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
                     prediction_bias = 0.0
                     print(f"[train_and_predict_model] Model {model_id} bias ({prediction_bias:.6f}) not significant, no correction applied")
                 else:
-                    # 🚨 ENHANCED FIX: Ultra-conservative bias correction with sign preservation
+                    # Ultra-conservative bias correction with sign preservation
                     # Limit bias correction to maximum ±2% to prevent sign flipping
-                    max_bias_correction = 0.02  # Reduced from 5% to 2%
+                    max_bias_correction = 0.02  # Maximum bias correction factor (2%)
                     original_bias = prediction_bias
                     prediction_bias = np.clip(prediction_bias, -max_bias_correction, max_bias_correction)
                     if abs(original_bias) > max_bias_correction:
@@ -2874,7 +2872,7 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
                 last_sample = X_train_scaled[-1:]
                 latest_prediction = model.predict(last_sample)[0]
                 
-                # 🚨 SIGN PRESERVATION: Ensure bias correction doesn't flip prediction sign
+                # Ensure bias correction doesn't flip prediction sign
                 corrected_prediction = latest_prediction - prediction_bias
                 
                 # Check if bias correction would flip the sign of a meaningful prediction
@@ -2883,17 +2881,17 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
                         # Sign flip detected - use reduced bias correction
                         reduced_bias = prediction_bias * 0.5  # Use only 50% of bias correction
                         corrected_prediction = latest_prediction - reduced_bias
-                        print(f"[train_and_predict_model] Model {model_id} 🚨 Sign flip prevented: original={latest_prediction:.6f}, full_bias={prediction_bias:.6f}, reduced_bias={reduced_bias:.6f}, final={corrected_prediction:.6f}")
+                        print(f"[train_and_predict_model] Model {model_id} Sign flip prevented: original={latest_prediction:.6f}, full_bias={prediction_bias:.6f}, reduced_bias={reduced_bias:.6f}, final={corrected_prediction:.6f}")
                         
                         # If still flipping, don't apply bias correction at all
                         if (latest_prediction > 0 and corrected_prediction < 0) or (latest_prediction < 0 and corrected_prediction > 0):
                             corrected_prediction = latest_prediction
-                            print(f"[train_and_predict_model] Model {model_id} 🚨 Complete bias correction skipped to preserve sign")
+                            print(f"[train_and_predict_model] Model {model_id} Complete bias correction skipped to preserve sign")
                 
-                # 🚨 ENHANCED SAFETY: More conservative individual model bounds checking
+                # Conservative individual model bounds checking
                 # Prevent any single model from dominating the ensemble with extreme predictions
                 if prediction_window == 1:
-                    max_individual_return = 0.10  # Reduced from 20% to 10% for daily
+                    max_individual_return = 0.10  # Maximum daily return threshold (10%)
                     if abs(corrected_prediction) > max_individual_return:
                         original_corrected = corrected_prediction
                         corrected_prediction = np.clip(corrected_prediction, -max_individual_return, max_individual_return)
@@ -2954,7 +2952,6 @@ def train_and_predict_model(X, y, model_id, prediction_window=1):
         
     except Exception as e:
         print(f"[train_and_predict_model] Error training model {model_id}: {e}")
-        import traceback
         traceback.print_exc()
         return [0.0]
 
@@ -3118,7 +3115,6 @@ def get_company_sentiment(ticker):
         
         if not api_key or api_key == 'your_key_here':
             # Simulated sentiment for demo purposes
-            import random
             random.seed(hash(ticker) % 1000)  # Consistent "random" for same ticker
             simulated_sentiment = random.uniform(-30, 40)  # Slightly bullish bias
             print(f"[get_company_sentiment] {ticker}: Using simulated sentiment: {simulated_sentiment:.1f}")
@@ -3126,7 +3122,6 @@ def get_company_sentiment(ticker):
         
         # Real API implementation would go here
         # For now, return simulated data even with API key
-        import random
         random.seed(hash(ticker) % 1000)
         sentiment = random.uniform(-30, 40)
         print(f"[get_company_sentiment] {ticker}: API-based sentiment: {sentiment:.1f}")
@@ -3154,7 +3149,6 @@ def get_sector_sentiment(ticker):
         sector = sector_map.get(ticker, 'General Market')
         
         # Simulated sector sentiment
-        import random
         random.seed(hash(sector) % 500)  # Consistent for same sector
         sector_sentiment = random.uniform(-20, 30)  # Generally less extreme than company
         
@@ -3330,7 +3324,6 @@ def adjust_confidence_interval_for_sentiment(lower_bound, upper_bound, original_
 
 def download_single_ticker_data(ticker, start_date):
     """Download data for a single ticker."""
-    import yfinance as yf
     end_date = datetime.today()
     try:
         df = yf.download(ticker, start=start_date, end=end_date, progress=False)
@@ -3373,14 +3366,11 @@ def train_model_single(df, model_ids, regime=None, regime_strength=0.5, predicti
         
     except Exception as e:
         print(f"[train_model_single] ERROR: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
 def predict_single_ticker_chart(df, predictions, prediction_window):
     """Create a chart for a single ticker: last X days of history and X days of forecast, normalized to 100 at -X."""
-    import matplotlib.pyplot as plt
-    import numpy as np
     plt.figure(figsize=(14, 8))
     plt.style.use('dark_background')
     if df is None or len(df) < prediction_window + 1:
@@ -3517,7 +3507,7 @@ def predict():
             if not model_preds:
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
             
-            # 🚀 SENTIMENT ENHANCEMENT FOR SINGLE TICKER
+            # Apply sentiment analysis to enhance prediction accuracy
             try:
                 print(f"[predict] 📰 Analyzing sentiment for {ticker_to_analyze}...")
                 
@@ -3574,7 +3564,7 @@ def predict():
                 print("[predict] 📈 Continuing with ML-only prediction...")
                 # Continue without sentiment if there's an error
             
-            # Use improved confidence interval calculation for single ticker
+            # Use confidence interval calculation for single ticker
             ci = fixed_single_ticker_prediction(df, model_preds, market_condition, market_strength, confidence_interval, prediction_window)
             chart_image = predict_single_ticker_chart(features_df, model_preds, prediction_window)
             # Get last close price for the ticker
@@ -3613,7 +3603,7 @@ def predict():
             else:
                 response['system_messages'].append({
                     'type': 'success', 
-                    'message': '📰 Enhanced prediction includes real-time sentiment analysis from news and market data.'
+                    'message': '📰 Prediction includes real-time sentiment analysis from news and market data.'
                 })
             
             print(f"[predict] Single ticker response selected_models: {response['selected_models']}")
@@ -3661,7 +3651,7 @@ def predict():
                 return jsonify({'error': '❌ Could not train machine learning models. Insufficient data or technical issues.'}), 400
             print(f"Trained models for {len(trained_models)} stocks")
 
-            # 🚀 GET MARKET SENTIMENT ONCE FOR ALL STOCKS IN INDEX
+            # Retrieve market sentiment data for all index constituents
             # This avoids making individual sentiment API calls for each stock
             market_sentiment_score = None
             market_sentiment_details = None
@@ -3684,7 +3674,7 @@ def predict():
                 if len(stock_predictions) < 3:
                     print(f"[DEBUG] {ticker} model predictions: {model_predictions}")
                 
-                # Use improved confidence interval calculation for each stock
+                # Use confidence interval calculation for each stock
                 stock_df = stock_data.get(ticker)
                 ci = fixed_single_ticker_prediction(
                     stock_df,
@@ -3695,13 +3685,13 @@ def predict():
                     prediction_window
                 )
                 
-                # 🚀 APPLY MARKET SENTIMENT TO INDIVIDUAL STOCK WITHIN INDEX
+                # Apply market sentiment to individual stock prediction
                 # Instead of getting sentiment for each stock, use the pre-calculated market sentiment
                 if market_sentiment_score is not None:
                     original_prediction = ci['prediction']
                     adjusted_prediction = apply_sentiment_adjustment(original_prediction, market_sentiment_score, prediction_window)
                     
-                    # 🚨 FIX: Adjust confidence intervals to match sentiment adjustment
+                    # Adjust confidence intervals to reflect sentiment impact
                     original_lower = ci['lower_bound']
                     original_upper = ci['upper_bound']
                     
@@ -3776,7 +3766,7 @@ def predict():
                 rank = i + 1  # Simple 1-based index for both cases
                 stock['rank'] = rank
 
-            # 🚀 SENTIMENT ENHANCEMENT FOR INDEX PREDICTION
+            # Apply sentiment analysis to index prediction
             index_sentiment_info = None
             try:
                 print(f"[predict] 📰 Applying market sentiment to index {index_name_for_response}...")
@@ -3798,7 +3788,7 @@ def predict():
                 # Update the index prediction with sentiment-adjusted value
                 index_prediction = adjusted_index_prediction
                 
-                # 🚨 CRITICAL FIX: Adjust confidence intervals for sentiment impact on index prediction
+                # Adjust confidence intervals for sentiment impact on index prediction
                 if abs(adjusted_index_prediction - original_index_prediction) > 0.001:  # 0.1% threshold
                     original_index_lower = index_lower
                     original_index_upper = index_upper
@@ -3864,11 +3854,10 @@ def predict():
         return jsonify(sanitize_for_json(response))
     except Exception as e:
         print(f"Error in prediction: {e}")
-        import traceback
         error_trace = traceback.format_exc()
         print(f"Full error trace: {error_trace}")
         
-        # Enhanced error reporting with specific error codes
+        # Error reporting with specific error codes
         error_response = {
             'error': str(e),
             'error_type': type(e).__name__,
@@ -4007,7 +3996,7 @@ if __name__ == '__main__':
     except Exception as e:
         print("⚠️ Market sentiment fetch skipped (will use fallback when needed)")
     
-    print("🚀 Server starting on http://localhost:5000")
+    print("Server starting on http://localhost:5000")
     print("=" * 50)
     
     # Suppress Flask startup messages
