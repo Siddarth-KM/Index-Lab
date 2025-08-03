@@ -1487,17 +1487,22 @@ def download_market_data_cache(start_date, force_refresh=False):
             manage_cache_size()  # Ensure cache doesn't grow too large
             return cached_data
     
-    print("[download_market_data_cache] Downloading market reference data...")
+    print(f"[download_market_data_cache] Starting download with start_date={start_date}, force_refresh={force_refresh}")
+    print("[download_market_data_cache] Downloading fresh market reference data...")
     market_data_cache = {}
     
     with ThreadPoolExecutor(max_workers=5) as executor:
         def fetch_market_symbol(symbol):
             try:
+                print(f"[download_market_data_cache] Downloading {symbol}...")
                 df = yf.download(symbol, start=start_date, progress=False)
                 if df is not None and not df.empty and len(df) >= 50:
+                    print(f"[download_market_data_cache] ✅ Successfully downloaded {symbol}: {len(df)} rows")
                     return symbol, df
+                else:
+                    print(f"[download_market_data_cache] ❌ Empty or insufficient data for {symbol}")
             except Exception as e:
-                print(f"[download_market_data_cache] Error downloading {symbol}: {e}")
+                print(f"[download_market_data_cache] ❌ Error downloading {symbol}: {e}")
             return symbol, None
         
         futures = {executor.submit(fetch_market_symbol, symbol): symbol for symbol in MARKET_SYMBOLS}
@@ -1505,6 +1510,8 @@ def download_market_data_cache(start_date, force_refresh=False):
             symbol, data = future.result()
             if data is not None:
                 market_data_cache[symbol] = data
+    
+    print(f"[download_market_data_cache] Completed with {len(market_data_cache)} market symbols: {list(market_data_cache.keys())}")
     
     # Save to cache and manage cache size
     save_to_cache(cache_key, market_data_cache)
@@ -1753,13 +1760,13 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         
         # 1. RSI (Relative Strength Index) - 14-day
         try:
-            delta = df['Close'].diff()
-            gain = np.where(delta > 0, delta, 0)
-            loss = np.where(delta < 0, -delta, 0)
-            avg_gain = pd.Series(gain).rolling(window=14).mean()
-            avg_loss = pd.Series(loss).rolling(window=14).mean()
-            rs = avg_gain / (avg_loss + 1e-8)  # Prevent division by zero
-            df['RSI'] = flatten_series(100 - (100 / (1 + rs)))
+            # Use the ta library's RSI implementation directly
+            rsi_indicator = RSIIndicator(close=df['Close'], window=14)
+            df['RSI'] = flatten_series(rsi_indicator.rsi())
+            
+            # Verify if RSI has proper values
+            if pd.isna(df['RSI']).all() or df['RSI'].var() == 0:
+                print(f"[add_features_to_stock_original] {ticker}: RSI calculation produced invalid values")
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating RSI: {e}")
             df['RSI'] = np.nan
@@ -1788,11 +1795,21 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
             for col in ['SMA_20', 'SD', 'Upper', 'Lower', 'percent_b', 'bb_width']:
                 df[col] = np.nan
         
-        # 4. Volume indicators
+        # 4. Volume indicators - SCALED VERSION
         try:
             df['volume_pct_change'] = flatten_series(df['Volume'].pct_change())
-            df['volume_ma'] = flatten_series(df['Volume'].rolling(window=20).mean())
-            df['volume_ratio'] = flatten_series(df['Volume'] / df['volume_ma'])
+            # Scale volume_ma by dividing by median volume to prevent extreme values
+            volume_ma_raw = df['Volume'].rolling(window=20).mean()
+            median_volume = df['Volume'].median()
+            if median_volume > 0:
+                df['volume_ma'] = flatten_series(volume_ma_raw / median_volume)
+                print(f"[add_features_to_stock_original] {ticker}: volume_ma scaled by median_volume={median_volume:.0f}")
+            else:
+                df['volume_ma'] = np.nan
+            
+            # volume_ratio calculation (already relative, should be fine)
+            volume_ma_raw_for_ratio = df['Volume'].rolling(window=20).mean()
+            df['volume_ratio'] = flatten_series(df['Volume'] / volume_ma_raw_for_ratio)
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating volume indicators: {e}")
             df['volume_pct_change'] = df['volume_ma'] = df['volume_ratio'] = np.nan
@@ -1808,7 +1825,7 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
             print(f"[add_features_to_stock_original] {ticker}: Error calculating ATR: {e}")
             df['ATR'] = np.nan
         
-        # 6. OBV (On-Balance Volume)
+        # 6. OBV (On-Balance Volume) - SCALED VERSION
         try:
             obv = []
             obv_val = 0
@@ -1821,7 +1838,20 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
                         obv_val -= row['Volume']
                 obv.append(obv_val)
                 prev_close = row['Close']
-            df['OBV'] = flatten_series(pd.Series(obv, index=df.index))
+            
+            # Scale OBV to prevent extreme values
+            if len(obv) > 0 and df['Volume'].notna().sum() > 0:
+                # Calculate average volume for scaling
+                avg_volume = df['Volume'].mean()
+                if avg_volume > 0:
+                    # Normalize OBV by average volume
+                    obv_scaled = [val / avg_volume for val in obv]
+                    df['OBV'] = flatten_series(pd.Series(obv_scaled, index=df.index))
+                    print(f"[add_features_to_stock_original] {ticker}: OBV scaled by avg_volume={avg_volume:.0f}, range=[{min(obv_scaled):.2f}, {max(obv_scaled):.2f}]")
+                else:
+                    df['OBV'] = np.nan
+            else:
+                df['OBV'] = np.nan
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating OBV: {e}")
             df['OBV'] = np.nan
@@ -2030,18 +2060,22 @@ def add_cross_asset_features(df, ticker, market_data_cache):
                 
                 calculated_features.extend(['qqq_spy_ratio', 'tech_outperform'])
         
-        # Enhanced Time-Based Features
+        # Enhanced Time-Based Features - FIXED: Use pandas built-in properties
         df['day_of_week'] = df.index.dayofweek
         df['month'] = df.index.month
         df['quarter'] = df.index.quarter
-        df['is_month_end'] = (df.index == df.index.to_period('M').end_time).astype(int)
-        df['is_quarter_end'] = (df.index == df.index.to_period('Q').end_time).astype(int)
+        # Fix for quarter_end detection using built-in property
+        df['is_quarter_end'] = df.index.is_quarter_end.astype(int)
         df['is_friday'] = (df.index.dayofweek == 4).astype(int)
         df['is_monday'] = (df.index.dayofweek == 0).astype(int)
         
+        # Log whether quarter ends were detected
+        quarter_end_count = df['is_quarter_end'].sum()
+        print(f"[add_cross_asset_features] {ticker}: Quarter-end dates found: {quarter_end_count}")
+        
         calculated_features.extend([
-            'day_of_week', 'month', 'quarter', 'is_month_end', 
-            'is_quarter_end', 'is_friday', 'is_monday'
+            'day_of_week', 'month', 'quarter', 'is_quarter_end', 
+            'is_friday', 'is_monday'
         ])
         
         # Market Regime Features (based on multiple assets)
@@ -2080,10 +2114,7 @@ def calculate_market_regime_features(market_data_cache, target_index):
             tlt_data = market_data_cache['TLT']['Close'].reindex(target_index, method='ffill', limit=5)
             regime_features['rising_rates'] = (tlt_data < tlt_data.rolling(50).mean()).astype(int)
         
-        # Dollar strength regime
-        if 'DXY' in market_data_cache:
-            dxy_data = market_data_cache['DXY']['Close'].reindex(target_index, method='ffill', limit=7)
-            regime_features['strong_dollar'] = (dxy_data > dxy_data.rolling(50).mean()).astype(int)
+        # 🗑️ REMOVED: strong_dollar feature as requested
         
     except Exception as e:
         print(f"[calculate_market_regime_features] Error: {e}")
@@ -2142,12 +2173,12 @@ def get_indicator_weights(regime, regime_strength):
         'gld_correlation': 'cross_asset',
         'qqq_spy_ratio': 'cross_asset', 'tech_outperform': 'cross_asset',
         'risk_on': 'cross_asset', 'risk_off': 'cross_asset', 
-        'rising_rates': 'cross_asset', 'strong_dollar': 'cross_asset',
+        'rising_rates': 'cross_asset',
+        # 🗑️ REMOVED: 'strong_dollar': 'cross_asset'
         
-        # Enhanced time features
+        # Enhanced time features - REMOVED is_month_end as requested
         'day_of_week': 'other', 'month': 'other', 'quarter': 'other', 
-        'is_month_end': 'other', 'is_quarter_end': 'other', 
-        'is_friday': 'other', 'is_monday': 'other'
+        'is_quarter_end': 'other', 'is_friday': 'other', 'is_monday': 'other'
     }
     # Add lagged features to group_map
     lag_features = {
@@ -2176,9 +2207,12 @@ def train_model_for_stock(ticker, df, model_ids, regime=None, regime_strength=0.
         # Extract feature columns (exclude basic OHLCV)
         feature_columns = [col for col in df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']]
         
-        # Validate that we have meaningful features
-        cross_asset_features = [col for col in feature_columns if any(keyword in col for keyword in 
-                               ['spy', 'vix', 'dxy', 'tlt', 'gld', 'qqq', 'relative_strength', 'correlation', 'beta', 'risk_on', 'risk_off'])]
+        # Validate that we have meaningful features - ENHANCED CROSS-ASSET DETECTION
+        cross_asset_features = [col for col in feature_columns if any(keyword in col.lower() for keyword in 
+                               ['spy', 'vix', 'dxy', 'tlt', 'gld', 'qqq', 'correlation', 'beta',
+                                'ratio', 'risk_on', 'risk_off', 'relative', 'sentiment',
+                                # Add more keywords to catch all cross-asset features
+                                'market', 'tlt_', 'dxy_', 'gld_', 'trend', 'regime', 'rising_rates', 'tech_outperform'])]
         technical_features = [col for col in feature_columns if col not in cross_asset_features]
         
         print(f"[train_model_for_stock] {ticker}: Technical features: {len(technical_features)}, Cross-asset features: {len(cross_asset_features)}")
@@ -3625,8 +3659,25 @@ def predict():
                 if market_sentiment_score is not None:
                     original_prediction = ci['prediction']
                     adjusted_prediction = apply_sentiment_adjustment(original_prediction, market_sentiment_score, prediction_window)
+                    
+                    # 🚨 FIX: Adjust confidence intervals to match sentiment adjustment
+                    original_lower = ci['lower_bound']
+                    original_upper = ci['upper_bound']
+                    
+                    # Adjust confidence interval bounds for sentiment impact using the same function we use for index
+                    adjusted_lower, adjusted_upper = adjust_confidence_interval_for_sentiment(
+                        original_lower, original_upper, original_prediction, adjusted_prediction
+                    )
+                    
+                    # Update all values consistently
                     ci['prediction'] = adjusted_prediction
-                    # Silent operation - no need to log every adjustment
+                    ci['lower_bound'] = adjusted_lower
+                    ci['upper_bound'] = adjusted_upper
+                    
+                    # Optionally log the adjustment for significant changes
+                    if abs(adjusted_prediction - original_prediction) > 0.005:  # 0.5% threshold
+                        print(f"[predict] 📊 {ticker}: Sentiment adjusted prediction: {original_prediction:.6f} → {adjusted_prediction:.6f}")
+                        print(f"[predict] 📊 {ticker}: Sentiment adjusted CI: [{original_lower:.6f}, {original_upper:.6f}] → [{adjusted_lower:.6f}, {adjusted_upper:.6f}]")
                 
                 last_close = float(stock_df['Close'].iloc[-1]) if stock_df is not None and 'Close' in stock_df.columns and not stock_df.empty else None
                 stock_predictions.append({
