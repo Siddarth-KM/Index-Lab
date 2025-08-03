@@ -1,11 +1,8 @@
 # ============================================================================
 # IMPORTS SECTION
 # ============================================================================
-
-# Standard Library Imports
 import base64
 import io
-import json
 import logging
 import os
 import pickle
@@ -17,15 +14,12 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from threading import Lock
-
-# Third-Party Imports
 import matplotlib
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
-import torch
 import yfinance as yf
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -33,8 +27,6 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from scipy import stats
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
-
-# Machine Learning Imports
 import xgboost as xgb
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, AdaBoostRegressor
 from sklearn.linear_model import BayesianRidge, ElasticNet
@@ -42,13 +34,10 @@ from sklearn.model_selection import cross_val_score, TimeSeriesSplit
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.svm import SVR
-
-# Technical Analysis Imports
-from ta.momentum import RSIIndicator, ROCIndicator, WilliamsRIndicator, StochasticOscillator
-from ta.trend import EMAIndicator, IchimokuIndicator, MACD
-from ta.volatility import AverageTrueRange, BollingerBands
-from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, AccDistIndexIndicator
-
+from ta.momentum import RSIIndicator, WilliamsRIndicator, StochasticOscillator
+from ta.trend import MACD
+from ta.volatility import AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator
 # Configure environment and warnings
 matplotlib.use('Agg')  # Use non-interactive backend
 warnings.filterwarnings('ignore')

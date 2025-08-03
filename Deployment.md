@@ -1,25 +1,26 @@
 # IndexLab: AI-Driven Financial Prediction Engine
 
 ## Overview
-IndexLab is a comprehensive financial prediction platform that uses machine learning models to predict stock movements and index performance with confidence intervals.
+IndexLab is a full-stack financial prediction platform combining a Python/Flask backend with a React/Tailwind frontend. It uses advanced machine learning models, technical indicators, and sentiment analysis to predict stock movements and index performance, providing confidence intervals and interactive visualizations.
 
 ## Features
-- **Multi-Model Prediction**: 10 different ML models for various market conditions
-- **Market Analysis**: Automatic market condition detection (Bull, Bear, Sideways, Volatile)
-- **Index & Custom Ticker Support**: Analyze major indices or individual stocks
-- **Confidence Intervals**: Adjustable prediction confidence levels
-- **Interactive Charts**: Visual representation of predictions and historical data
-- **Real-time Data**: Live stock data from Yahoo Finance
+- Multi-model ML backend (XGBoost, Random Forest, Neural Network, etc.)
+- Sentiment analysis and technical indicators
+- Cross-asset and custom ticker support
+- Confidence intervals and market condition detection
+- Interactive charts and real-time data
+- Caching, threading, and parallel processing for performance
+- Modern React frontend with Tailwind CSS
 
 ## Project Structure
 ```
 IndexLab/
-├── frontend/                 # React application
+├── frontend/                 # React + Tailwind CSS web app
 │   ├── src/
 │   ├── public/
 │   ├── package.json
 │   └── ...
-├── backend_server.py         # Flask backend server
+├── backend_server.py         # Flask backend server (ML engine)
 ├── requirements.txt          # Python dependencies
 ├── README.md
 └── Deployment.md
@@ -28,42 +29,36 @@ IndexLab/
 ## Setup Instructions
 
 ### Backend Setup (Python/Flask)
-
-1. **Install Python Dependencies**
+1. Install Python dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-
-2. **Start Backend Server**
+2. Start backend server:
    ```bash
    python backend_server.py
    ```
-   The backend will run on `http://localhost:5000`
-
-3. **Verify Backend Health**
+   The backend runs at `http://localhost:5000`
+3. Verify backend health:
    ```bash
    curl http://localhost:5000/api/health
    ```
 
-### Frontend Setup (React)
-
-1. **Navigate to Frontend Directory**
+### Frontend Setup (React/Tailwind)
+1. Navigate to frontend directory:
    ```bash
    cd frontend
    ```
-
-2. **Install Node.js Dependencies**
+2. Install Node.js dependencies:
    ```bash
    npm install
    ```
-
-3. **Start Development Server**
+3. Start development server:
    ```bash
    npm start
    ```
-   The frontend will run on `http://localhost:3000`
+   The frontend runs at `http://localhost:3000`
 
-## API Endpoints
+## API Endpoints (Backend)
 
 ### POST /api/predict
 Main prediction endpoint that accepts:
@@ -102,17 +97,18 @@ Returns:
 Health check endpoint.
 
 ## Machine Learning Models
-
-1. **XGBoost Quantile Regression** - Low volatility, precise predictions
-2. **Random Forest Bootstrap** - Balanced performance
-3. **Neural Network Conformal** - High volatility, complex patterns
-4. **Extra Trees Bootstrap** - High volatility, aggressive
-5. **AdaBoost Conformal** - High volatility, adaptive
-6. **Bayesian Ridge Conformal** - Low volatility, conservative
-7. **Support Vector Regression** - Balanced, stable
-8. **Gradient Boosting Conformal** - High volatility, adaptive
-9. **Elastic Net Conformal** - Low volatility, regularized
-10. **MLPRegressor Sequence Model** - Sequence modeling using scikit-learn MLPRegressor (not a deep learning transformer)
+| Model | Type | Best For |
+|-------|------|----------|
+| XGBoost Quantile Regression | Gradient Boosting | Low volatility, precise predictions |
+| Random Forest Bootstrap | Ensemble | Balanced performance |
+| Neural Network Conformal | Deep Learning | High volatility, complex patterns |
+| Extra Trees Bootstrap | Ensemble | High volatility, aggressive |
+| AdaBoost Conformal | Boosting | High volatility, adaptive |
+| Bayesian Ridge Conformal | Bayesian | Low volatility, conservative |
+| Support Vector Regression | SVM | Balanced, stable |
+| Gradient Boosting Conformal | Boosting | High volatility, adaptive |
+| Elastic Net Conformal | Regularized | Low volatility, regularized |
+| MLPRegressor Sequence Model | MLPRegressor | Sequence modeling using scikit-learn MLPRegressor |
 
 ## Market Conditions
 
