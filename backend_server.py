@@ -42,7 +42,6 @@ from sklearn.svm import SVR
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import xgboost as xgb
-# Removed TensorFlow and PyTorch imports - using scikit-learn alternatives
 import matplotlib.cm as cm
 from ta.momentum import WilliamsRIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
@@ -137,7 +136,6 @@ MARKET_SENTIMENT_TERMS = [
 # Index-specific search terms for news
 INDEX_SEARCH_TERMS = {
     'SPY': ['S&P 500', 'SPY ETF', 'S&P500', 'Standard & Poor\'s 500', 'SP500'],
-    'DOW': ['Dow Jones', 'DJIA', 'Dow Jones Industrial Average', 'Industrial Average', 'DIA ETF'],
     'DIA': ['Dow Jones', 'DJIA', 'Dow Jones Industrial Average', 'Industrial Average', 'DIA ETF'],
     'NASDAQ': ['NASDAQ', 'NASDAQ Composite', 'NASDAQ 100', 'QQQ ETF', 'tech index'],
     'SP400': ['S&P 400', 'S&P MidCap 400', 'SP400', 'mid-cap index', 'IJH ETF'],
@@ -167,7 +165,7 @@ MARKET_SENTIMENT_LOCK = Lock()
 LAST_NEWS_API_CALL = None
 
 # List of supported index names
-SUPPORTED_INDEXES = ['SPY', 'DOW', 'DIA', 'NASDAQ', 'SP400', 'SPLV', 'SPHB']
+SUPPORTED_INDEXES = ['SPY', 'DIA', 'NASDAQ', 'SP400', 'SPLV', 'SPHB']
 
 def is_index_ticker(ticker):
     """Check if a ticker is one of our supported indexes"""
@@ -186,7 +184,6 @@ def initialize_sentiment_model():
     try:
         print("Loading sentiment model...")
         # Suppress progress bars and verbose output
-        import logging
         logging.getLogger("transformers").setLevel(logging.ERROR)
         logging.getLogger("urllib3").setLevel(logging.ERROR)
         
@@ -751,24 +748,26 @@ def get_index_sentiment_score(index_name):
         # No index-specific sentiment since we skip news search
         index_avg_sentiment = 0.0
         
-        # Create result data consistent with single ticker format
+        # Create result data consistent with single ticker format but with index-specific fields
         result = {
             'sentiment_score': final_sentiment,
-            'company_articles': 0,   # No index articles since we skip API calls
+            'index_articles': 0,   # No index articles since we skip API calls
             'sector_articles': 0,    # No sector news for indexes
             'market_sentiment': market_sentiment,
             'sector': 'Index',       # Mark as index
             'timestamp': time.time(),
             # Dynamic weights for frontend consistency
-            'dynamic_company_weight': index_weight,  # Index news weight (always 0)
+            'dynamic_index_weight': index_weight,  # Index news weight (always 0)
             'dynamic_sector_weight': 0.0,            # No sector for indexes
             'dynamic_market_weight': market_weight,  # Market weight (always 1.0)
-            'has_company_news': has_index_news,      # Always False for indexes
+            'has_index_news': has_index_news,      # Always False for indexes
             'has_sector_news': False,                # Never have sector news for indexes
             'is_index': True,                        # Flag to identify index sentiment
-            # Add the actual sentiment scores
-            'company_sentiment_score': index_avg_sentiment,  # Always 0 for indexes
-            'sector_sentiment_score': 0.0                    # No sector sentiment for indexes
+            # Add the actual sentiment scores - renamed for indices
+            'index_sentiment_score': index_avg_sentiment,  # Always 0 for indexes
+            'sector_sentiment_score': 0.0,                  # No sector sentiment for indexes
+            'api_limit_reached': True,                      # We're always treating it as API limit reached since we skip calls
+            'using_fallback': True                         # Always using market data fallback
         }
         
         # Cache the result
@@ -780,17 +779,20 @@ def get_index_sentiment_score(index_name):
         print(f"Error getting index sentiment for {index_name}: {e}")
         return {
             'sentiment_score': 0.0,
-            'company_articles': 0,
+            'index_articles': 0,
             'sector_articles': 0,
             'market_sentiment': 0.0,
             'sector': 'Index',
             'timestamp': time.time(),
-            'dynamic_company_weight': 0.0,
+            'dynamic_index_weight': 0.0,
             'dynamic_sector_weight': 0.0,
             'dynamic_market_weight': 1.0,
-            'has_company_news': False,
+            'has_index_news': False,
             'has_sector_news': False,
-            'is_index': True
+            'is_index': True,
+            'index_sentiment_score': 0.0,
+            'api_limit_reached': True,
+            'using_fallback': True
         }
 
 def get_sentiment_score(ticker):
@@ -3184,28 +3186,51 @@ def analyze_ticker_sentiment(ticker):
         
         sentiment_score = sentiment_data['sentiment_score']
         
-        sentiment_details = {
-            'company_sentiment': sentiment_data.get('company_sentiment_score', 0.0),  # Actual sentiment score
-            'sector_sentiment': sentiment_data.get('sector_sentiment_score', 0.0),    # Actual sentiment score
-            'market_sentiment': sentiment_data.get('market_sentiment', 0.0),
-            # Use dynamic weights that were actually applied
-            'company_weight': sentiment_data.get('dynamic_company_weight', 0),
-            'sector_weight': sentiment_data.get('dynamic_sector_weight', 0),
-            'market_weight': sentiment_data.get('dynamic_market_weight', SENTIMENT_CONFIG['MARKET_NEWS_WEIGHT']),
-            'has_company_news': sentiment_data.get('has_company_news', False),
-            'has_sector_news': sentiment_data.get('has_sector_news', False),
-            'final_score': sentiment_score,
-            'sector': sentiment_data.get('sector', 'Unknown'),
-            'cache_used': True,
-            'is_index': sentiment_data.get('is_index', False),
-            # Also include article counts for informational purposes
-            'company_articles': sentiment_data.get('company_articles', 0),
-            'sector_articles': sentiment_data.get('sector_articles', 0)
-        }
-        
-        print(f"[analyze_ticker_sentiment] ✅ {ticker}: Market={sentiment_data.get('market_sentiment', 0.0):.1f}, "
-              f"Company={sentiment_data.get('company_sentiment_score', 0.0):.1f} ({sentiment_data.get('company_articles', 0)} articles), "
-              f"Sector={sentiment_data.get('sector_sentiment_score', 0.0):.1f} ({sentiment_data.get('sector_articles', 0)} articles), Final={sentiment_score:.1f}")
+        # Create appropriate sentiment details object based on whether it's an index or stock
+        if is_index:
+            sentiment_details = {
+                'index_sentiment': sentiment_data.get('index_sentiment_score', 0.0),
+                'market_sentiment': sentiment_data.get('market_sentiment', 0.0),
+                # Use dynamic weights that were actually applied
+                'index_weight': sentiment_data.get('dynamic_index_weight', 0),
+                'market_weight': sentiment_data.get('dynamic_market_weight', 1.0),
+                'has_index_news': sentiment_data.get('has_index_news', False),
+                'final_score': sentiment_score,
+                'sector': 'Index',
+                'cache_used': True,
+                'is_index': True,
+                'api_limit_reached': sentiment_data.get('api_limit_reached', True),
+                'using_fallback': sentiment_data.get('using_fallback', True),
+                # Also include article counts for informational purposes
+                'index_articles': sentiment_data.get('index_articles', 0),
+            }
+            
+            print(f"[analyze_ticker_sentiment] ✅ {ticker}: Market={sentiment_data.get('market_sentiment', 0.0):.1f}, "
+                f"Index={sentiment_data.get('index_sentiment_score', 0.0):.1f} "
+                f"({sentiment_data.get('index_articles', 0)} articles), Final={sentiment_score:.1f}")
+        else:
+            sentiment_details = {
+                'company_sentiment': sentiment_data.get('company_sentiment_score', 0.0),
+                'sector_sentiment': sentiment_data.get('sector_sentiment_score', 0.0),
+                'market_sentiment': sentiment_data.get('market_sentiment', 0.0),
+                # Use dynamic weights that were actually applied
+                'company_weight': sentiment_data.get('dynamic_company_weight', 0),
+                'sector_weight': sentiment_data.get('dynamic_sector_weight', 0),
+                'market_weight': sentiment_data.get('dynamic_market_weight', SENTIMENT_CONFIG['MARKET_NEWS_WEIGHT']),
+                'has_company_news': sentiment_data.get('has_company_news', False),
+                'has_sector_news': sentiment_data.get('has_sector_news', False),
+                'final_score': sentiment_score,
+                'sector': sentiment_data.get('sector', 'Unknown'),
+                'cache_used': True,
+                'is_index': False,
+                # Also include article counts for informational purposes
+                'company_articles': sentiment_data.get('company_articles', 0),
+                'sector_articles': sentiment_data.get('sector_articles', 0)
+            }
+            
+            print(f"[analyze_ticker_sentiment] ✅ {ticker}: Market={sentiment_data.get('market_sentiment', 0.0):.1f}, "
+                f"Company={sentiment_data.get('company_sentiment_score', 0.0):.1f} ({sentiment_data.get('company_articles', 0)} articles), "
+                f"Sector={sentiment_data.get('sector_sentiment_score', 0.0):.1f} ({sentiment_data.get('sector_articles', 0)} articles), Final={sentiment_score:.1f}")
         
         return sentiment_score, sentiment_details
         
@@ -3217,7 +3242,8 @@ def analyze_ticker_sentiment(ticker):
             'sector_sentiment': 0.0,
             'market_sentiment': 0.0,
             'final_score': 0.0,
-            'error': str(e)
+            'error': str(e),
+            'is_index': is_index_ticker(ticker)
         }
 
 def apply_sentiment_adjustment(ml_prediction, sentiment_score, prediction_window):
@@ -3499,7 +3525,7 @@ def predict():
                 sentiment_score, sentiment_details = analyze_ticker_sentiment(ticker_to_analyze)
                 print(f"[predict] 📊 Sentiment score for {ticker_to_analyze}: {sentiment_score}")
                 
-                # Check if this is an index - skip ML prediction adjustments for indexes
+                # Check if this is an index - special handling for indexes
                 is_index = sentiment_details.get('is_index', False)
                 
                 if is_index:
@@ -3511,22 +3537,37 @@ def predict():
                     print(f"[predict] 🎯 {ticker_to_analyze}: ML prediction: {original_prediction:.4f} ({original_prediction*100:.2f}%)")
                     print(f"[predict] 📰 {ticker_to_analyze}: Index sentiment adjustment: {sentiment_score}/100 (market only)")
                     print(f"[predict] ✅ {ticker_to_analyze}: Final prediction: {adjusted_prediction:.4f} ({adjusted_prediction*100:.2f}%)")
+                    
+                    # Update the model predictions with sentiment data - use index-specific fields
+                    if isinstance(model_preds, dict):
+                        model_preds['prediction'] = adjusted_prediction
+                        model_preds['sentiment_score'] = sentiment_score
+                        model_preds['sentiment_details'] = sentiment_details
+                        model_preds['original_ml_prediction'] = original_prediction
+                        model_preds['sentiment_adjusted'] = True
+                        model_preds['is_index'] = True
+                        model_preds['api_limit_reached'] = sentiment_details.get('api_limit_reached', True)
+                        model_preds['using_fallback'] = sentiment_details.get('using_fallback', True)
                 else:
-                    # Apply sentiment adjustment to ML prediction for single tickers
+                    # Stock handling - apply sentiment adjustment using company + sector sentiment
+                    print(f"[predict] 📈 {ticker_to_analyze} is a stock - applying sentiment adjustment with company/sector data")
                     original_prediction = model_preds.get('prediction', 0.0) if isinstance(model_preds, dict) else 0.0
                     adjusted_prediction = apply_sentiment_adjustment(original_prediction, sentiment_score, prediction_window)
                     
                     print(f"[predict] 🎯 {ticker_to_analyze}: ML prediction: {original_prediction:.4f} ({original_prediction*100:.2f}%)")
-                    print(f"[predict] 📰 {ticker_to_analyze}: Sentiment adjustment: {sentiment_score}/100")
+                    print(f"[predict] 📰 {ticker_to_analyze}: Stock sentiment adjustment: {sentiment_score}/100 (company + sector)")
                     print(f"[predict] ✅ {ticker_to_analyze}: Final prediction: {adjusted_prediction:.4f} ({adjusted_prediction*100:.2f}%)")
-                
-                # Update the model predictions with sentiment data
-                if isinstance(model_preds, dict):
-                    model_preds['prediction'] = adjusted_prediction
-                    model_preds['sentiment_score'] = sentiment_score
-                    model_preds['sentiment_details'] = sentiment_details
-                    model_preds['original_ml_prediction'] = original_prediction
-                    model_preds['sentiment_adjusted'] = True  # Both single tickers and indexes now get sentiment adjustments
+                    
+                    # Update the model predictions with sentiment data - use stock-specific fields
+                    if isinstance(model_preds, dict):
+                        model_preds['prediction'] = adjusted_prediction
+                        model_preds['sentiment_score'] = sentiment_score
+                        model_preds['sentiment_details'] = sentiment_details
+                        model_preds['original_ml_prediction'] = original_prediction
+                        model_preds['sentiment_adjusted'] = True
+                        model_preds['is_index'] = False
+                        model_preds['api_limit_reached'] = sentiment_details.get('api_limit_reached', True)
+                        model_preds['using_fallback'] = sentiment_details.get('using_fallback', True)
                 
             except Exception as e:
                 print(f"[predict] ⚠️ Sentiment analysis error for {ticker_to_analyze}: {e}")
@@ -3740,22 +3781,18 @@ def predict():
             try:
                 print(f"[predict] 📰 Applying market sentiment to index {index_name_for_response}...")
                 
-                # Use the same market sentiment that was already calculated for individual stocks
-                if market_sentiment_score is not None and market_sentiment_details is not None:
-                    sentiment_score = market_sentiment_score
-                    sentiment_details = market_sentiment_details
-                    print(f"[predict] 📊 Using pre-calculated market sentiment for {index_name_for_response}: {sentiment_score}")
-                else:
-                    # Fallback: get sentiment analysis for the index if not already calculated
-                    sentiment_score, sentiment_details = analyze_ticker_sentiment(index_name_for_response)
-                    print(f"[predict] 📊 Fallback sentiment score for {index_name_for_response}: {sentiment_score}")
+                # For index prediction (multiple tickers), get index-specific sentiment
+                sentiment_score, sentiment_details = analyze_ticker_sentiment(index_name_for_response)
+                print(f"[predict] 📊 Index sentiment score for {index_name_for_response}: {sentiment_score}")
+                print(f"[predict] 📊 API limit reached: {sentiment_details.get('api_limit_reached', 'Unknown')}")
+                print(f"[predict] 📊 Using fallback: {sentiment_details.get('using_fallback', 'Unknown')}")
                 
                 # Apply sentiment adjustment to index prediction
                 original_index_prediction = index_prediction
                 adjusted_index_prediction = apply_sentiment_adjustment(original_index_prediction, sentiment_score, prediction_window)
                 
                 print(f"[predict] 🎯 {index_name_for_response}: ML prediction: {original_index_prediction:.4f} ({original_index_prediction*100:.2f}%)")
-                print(f"[predict] 📰 {index_name_for_response}: Market sentiment adjustment: {sentiment_score}/100 (market only)")
+                print(f"[predict] 📰 {index_name_for_response}: Index sentiment adjustment: {sentiment_score}/100 (market only)")
                 print(f"[predict] ✅ {index_name_for_response}: Final prediction: {adjusted_index_prediction:.4f} ({adjusted_index_prediction*100:.2f}%)")
                 
                 # Update the index prediction with sentiment-adjusted value
@@ -3773,11 +3810,14 @@ def predict():
                     print(f"[predict] 📊 {index_name_for_response}: Original CI: [{original_index_lower:.6f}, {original_index_upper:.6f}]")
                     print(f"[predict] 📊 {index_name_for_response}: Sentiment-adjusted CI: [{index_lower:.6f}, {index_upper:.6f}] = [{index_lower*100:.3f}%, {index_upper*100:.3f}%]")
                 
-                # Store sentiment information for response
+                # Store sentiment information for response using index-specific structure
                 index_sentiment_info = {
                     'sentiment_score': sentiment_score,
                     'original_ml_prediction': original_index_prediction,
-                    'sentiment_details': sentiment_details
+                    'sentiment_details': sentiment_details,
+                    'is_index': True,
+                    'api_limit_reached': sentiment_details.get('api_limit_reached', True),
+                    'using_fallback': sentiment_details.get('using_fallback', True)
                 }
                 
             except Exception as e:
