@@ -128,15 +128,7 @@ MARKET_SENTIMENT_TERMS = [
     'TLT'     # Treasury ETF (flight to safety indicator)
 ]
 
-# Index-specific search terms for news
-INDEX_SEARCH_TERMS = {
-    'SPY': ['S&P 500', 'SPY ETF', 'S&P500', 'Standard & Poor\'s 500', 'SP500'],
-    'DIA': ['Dow Jones', 'DJIA', 'Dow Jones Industrial Average', 'Industrial Average', 'DIA ETF'],
-    'NASDAQ': ['NASDAQ', 'NASDAQ Composite', 'NASDAQ 100', 'QQQ ETF', 'tech index'],
-    'SP400': ['S&P 400', 'S&P MidCap 400', 'SP400', 'mid-cap index', 'IJH ETF'],
-    'SPLV': ['S&P 500 Low Volatility', 'SPLV ETF', 'low volatility ETF', 'defensive stocks'],
-    'SPHB': ['S&P 500 High Beta', 'SPHB ETF', 'high beta ETF', 'aggressive stocks']
-}
+
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -1236,20 +1228,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Thread-safe cache
 cache_lock = Lock()
 
-# Model configurations
-MODEL_CONFIGS = {
-    1: {'name': 'XGBoost Quantile Regression', 'description': 'Low vol, precise'},
-    2: {'name': 'Random Forest Bootstrap', 'description': 'Balanced'},
-    3: {'name': 'Neural Network Conformal', 'description': 'High vol, complex'},
-    4: {'name': 'Extra Trees Bootstrap', 'description': 'High vol, aggressive'},
-    5: {'name': 'AdaBoost Conformal', 'description': 'High vol, adaptive'},
-    6: {'name': 'Bayesian Ridge Conformal', 'description': 'Low vol, conservative'},
-    7: {'name': 'Support Vector Regression', 'description': 'Balanced, stable'},
-    8: {'name': 'Gradient Boosting Conformal', 'description': 'High vol, adaptive'},
-    9: {'name': 'Elastic Net Conformal', 'description': 'Low vol, regularized'},
-    10: {'name': 'Transformer', 'description': 'Deep learning, sequence modeling'}
-}
-
 # Global cache for market data
 market_data_cache = {}
 
@@ -1772,6 +1750,22 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating MACD: {e}")
             df['macd'] = df['macd_signal'] = df['macd_histogram'] = np.nan
+        
+        # Ensure ema_diff exists for detect_market_regime function
+        try:
+            if 'ema_diff' not in df.columns:
+                if 'macd_histogram' in df.columns:
+                    # Use macd_histogram as ema_diff (they're the same calculation)
+                    df['ema_diff'] = df['macd_histogram']
+                elif 'macd' in df.columns and 'macd_signal' in df.columns:
+                    # Calculate ema_diff from macd and macd_signal
+                    df['ema_diff'] = flatten_series(df['macd'] - df['macd_signal'])
+                else:
+                    # Fallback to NaN if neither exists
+                    df['ema_diff'] = np.nan
+        except Exception as e:
+            print(f"[add_features_to_stock_original] {ticker}: Error ensuring ema_diff: {e}")
+            df['ema_diff'] = np.nan
         
         # 3. Bollinger Bands
         try:
@@ -3093,32 +3087,7 @@ def create_multi_stock_prediction_chart(stock_data, stock_predictions, predictio
     return image_base64
 
 # --- Single Ticker Functions (no parallelization) ---
-def get_company_sentiment(ticker):
-    """
-    Get sentiment score for company-specific news
-    Returns: sentiment score from -100 to +100
-    """
-    try:
-        # Check if we have Alpha Vantage API key
-        api_key = SENTIMENT_CONFIG.get('ALPHA_VANTAGE_API_KEY', 'your_key_here')
-        
-        if not api_key or api_key == 'your_key_here':
-            # Simulated sentiment for demo purposes
-            random.seed(hash(ticker) % 1000)  # Consistent "random" for same ticker
-            simulated_sentiment = random.uniform(-30, 40)  # Slightly bullish bias
-            print(f"[get_company_sentiment] {ticker}: Using simulated sentiment: {simulated_sentiment:.1f}")
-            return simulated_sentiment
-        
-        # Real API implementation would go here
-        # For now, return simulated data even with API key
-        random.seed(hash(ticker) % 1000)
-        sentiment = random.uniform(-30, 40)
-        print(f"[get_company_sentiment] {ticker}: API-based sentiment: {sentiment:.1f}")
-        return sentiment
-        
-    except Exception as e:
-        print(f"[get_company_sentiment] Error for {ticker}: {e}")
-        return 0.0
+
 
 def get_sector_sentiment(ticker):
     """
