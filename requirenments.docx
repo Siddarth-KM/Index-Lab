@@ -28,10 +28,9 @@ Functional Requirements:
 
 Non-Functional Requirements:
 ----------------------------
-1. The system must respond to prediction requests within 10 seconds for typical use cases.
+1. The system must respond to prediction requests within few minutes for typical use cases.
 2. The UI must be responsive and accessible on both desktop and mobile devices.
 3. The backend must handle at least 10 concurrent prediction requests.
-4. All user data and API endpoints must be secured against common web vulnerabilities.
 5. The system must be maintainable, with clear code structure and documentation.
 6. The system must be extensible to support additional models, indexes, or data sources in the future.
 7. The system must provide accurate and reliable predictions, with clear communication of confidence and limitations. 
