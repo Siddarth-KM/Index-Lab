@@ -1061,7 +1061,20 @@ const StockPredictionApp = () => {
                               <div className="text-gray-300 text-sm">
                                 Confidence Interval: {results.index_prediction && results.index_prediction.lower !== undefined && results.index_prediction.upper !== undefined ? `${(results.index_prediction.lower * 100).toFixed(2)}% - ${(results.index_prediction.upper * 100).toFixed(2)}%` : '--'}
                               </div>
-                              <div className="text-gray-300 text-sm">
+                              
+                              {/* Directional Probability Display for Single Ticker */}
+                              {results.index_prediction && results.index_prediction.direction !== undefined && results.index_prediction.direction_probability !== undefined && (
+                                <div className="mt-4 pt-4 border-t border-gray-600/50">
+                                  <div className="text-sm">
+                                    <span className="text-gray-300">Direction Probability: </span>
+                                    <span className={`font-semibold ${results.index_prediction.direction === 'up' ? 'text-green-400' : 'text-red-400'}`}>
+                                      {results.index_prediction.direction === 'up' ? '↑' : '↓'} {Math.min(100, Math.max(0, results.index_prediction.direction_probability)).toFixed(1)}%
+                                    </span>
+                                  </div>
+                                </div>
+                              )}
+                              
+                              <div className="text-gray-300 text-sm mt-2">
                                 Last Close: {results.index_prediction && results.index_prediction.close !== null ? `$${results.index_prediction.close.toFixed(2)}` : '--'}
                               </div>
                             </div>
@@ -1160,7 +1173,20 @@ const StockPredictionApp = () => {
                           <div className="text-gray-300 text-sm">
                                 Confidence Interval: {results.index_prediction && results.index_prediction.lower !== undefined && results.index_prediction.upper !== undefined ? `${(results.index_prediction.lower * 100).toFixed(2)}% - ${(results.index_prediction.upper * 100).toFixed(2)}%` : '--'}
                           </div>
-                          <div className="text-gray-300 text-sm">
+                          
+                          {/* Directional Probability Display for Index Prediction */}
+                          {results.index_prediction && results.index_prediction.direction !== undefined && results.index_prediction.direction_probability !== undefined && (
+                            <div className="mt-4 pt-4 border-t border-gray-600/50">
+                              <div className="text-sm">
+                                <span className="text-gray-300">Direction Probability: </span>
+                                <span className={`font-semibold ${results.index_prediction.direction === 'up' ? 'text-green-400' : 'text-red-400'}`}>
+                                  {results.index_prediction.direction === 'up' ? '↑' : '↓'} {Math.min(100, Math.max(0, results.index_prediction.direction_probability)).toFixed(1)}%
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                          
+                          <div className="text-gray-300 text-sm mt-2">
                                 Last Close: {results.index_prediction && results.index_prediction.close !== null ? `$${results.index_prediction.close.toFixed(2)}` : '--'}
                           </div>
                       </div>
@@ -1179,7 +1205,22 @@ const StockPredictionApp = () => {
                               <div className="text-lg font-bold text-white mb-1">{stock.ticker}</div>
                               <div className={`text-2xl font-bold mb-1 ${stock.pred > 0 ? 'text-green-400' : 'text-red-400'}`}>{(stock.pred * 100).toFixed(2)}%</div>
                               <div className="text-xs text-gray-400">{(stock.lower * 100).toFixed(1)}% - {(stock.upper * 100).toFixed(1)}%</div>
-                              <div className="text-xs text-gray-400">Last Close: {stock.close !== null ? `$${stock.close.toFixed(2)}` : '--'}</div>
+                              
+                              {/* Directional Probability Display */}
+                              {stock.direction !== undefined && stock.direction_probability !== undefined && (
+                                <div className="mt-2 pt-2 border-t border-gray-600/50">
+                                  <div className="text-xs">
+                                    <span className="text-gray-400">Direction Probability: </span>
+                                    <span className={`font-semibold ${stock.direction === 'up' ? 'text-green-400' : 'text-red-400'}`}>
+                                      {stock.direction === 'up' ? '↑' : '↓'} {Math.min(100, Math.max(0, stock.direction_probability)).toFixed(1)}%
+                                    </span>
+                                  </div>
+                                </div>
+                              )}
+                              
+                              <div className="text-xs text-gray-400 mt-1">
+                                Last Close: {stock.close !== null ? `$${stock.close.toFixed(2)}` : '--'}
+                              </div>
                               <div className="text-xs text-blue-300">Rank #{index + 1}</div>
                             </div>
                           </div>
