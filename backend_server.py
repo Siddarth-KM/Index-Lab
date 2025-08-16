@@ -3701,7 +3701,7 @@ def predict():
             # Add directional confidence to response if available
             if direction_result:
                 response['index_prediction']['direction'] = direction_result['direction']
-                response['index_prediction']['direction_probability'] = direction_result['probability']
+                response['index_prediction']['direction_probability'] = direction_result['direction_probability']
             
             # Add sentiment information to response if available
             if isinstance(model_preds, dict) and 'sentiment_score' in model_preds:
@@ -3836,15 +3836,8 @@ def predict():
                     'upper': ci['upper_bound'],
                     'close': last_close
                 })
-            # Sort based on showType parameter (default to 'top' if not specified)
-            show_type = data.get('showType', 'top')
-            # Sort predictions:
-            # For 'top': highest predictions first (most positive)
-            # For 'worst': lowest predictions first (most negative)
-            stock_predictions.sort(key=lambda x: x['pred'], reverse=(show_type == 'top'))
-            stock_predictions = stock_predictions[:num_stocks]
-
-            # Add directional confidence prediction
+            
+            # Add directional confidence prediction BEFORE sorting
             try:
                 stock_predictions = apply_direction_confidence_parallel(
                     stock_predictions, 
@@ -3855,6 +3848,65 @@ def predict():
             except Exception as e:
                 print(f"⚠️ Error applying directional confidence: {e}")
                 # Continue without direction confidence if there's an error
+
+            # Filter predictions based on showType and directional probability
+            show_type = data.get('showType', 'top')
+            original_count = len(stock_predictions)
+            
+            if show_type == 'top':
+                # First check how many stocks have direction info
+                stocks_with_direction = [s for s in stock_predictions if 'direction' in s]
+                
+                if len(stocks_with_direction) >= num_stocks:
+                    # If we have enough stocks with direction, filter strictly
+                    filtered_predictions = [s for s in stock_predictions if 'direction' in s and s['direction'] == 'up']
+                else:
+                    # Fall back to more lenient filtering if we don't have enough stocks with direction
+                    filtered_predictions = [
+                        s for s in stock_predictions 
+                        if ('direction' not in s) or ('direction' in s and s['direction'] == 'up')
+                    ]
+                
+                # Ensure we have enough predictions after filtering
+                if len(filtered_predictions) < num_stocks and len(filtered_predictions) < len(stock_predictions):
+                    print(f"⚠️ After UP direction filtering, only {len(filtered_predictions)} stocks remain. Adding some additional stocks to meet requested count.")
+                    # Add some of the excluded stocks if we don't have enough
+                    excluded = [s for s in stock_predictions if s not in filtered_predictions]
+                    filtered_predictions.extend(excluded[:num_stocks - len(filtered_predictions)])
+                
+                stock_predictions = filtered_predictions
+                
+            elif show_type == 'worst':
+                # First check how many stocks have direction info
+                stocks_with_direction = [s for s in stock_predictions if 'direction' in s]
+                
+                if len(stocks_with_direction) >= num_stocks:
+                    # If we have enough stocks with direction, filter strictly
+                    filtered_predictions = [s for s in stock_predictions if 'direction' in s and s['direction'] == 'down']
+                else:
+                    # Fall back to more lenient filtering if we don't have enough stocks with direction
+                    filtered_predictions = [
+                        s for s in stock_predictions 
+                        if ('direction' not in s) or ('direction' in s and s['direction'] == 'down')
+                    ]
+                
+                # Ensure we have enough predictions after filtering
+                if len(filtered_predictions) < num_stocks and len(filtered_predictions) < len(stock_predictions):
+                    print(f"⚠️ After DOWN direction filtering, only {len(filtered_predictions)} stocks remain. Adding some additional stocks to meet requested count.")
+                    # Add some of the excluded stocks if we don't have enough
+                    excluded = [s for s in stock_predictions if s not in filtered_predictions]
+                    filtered_predictions.extend(excluded[:num_stocks - len(filtered_predictions)])
+                
+                stock_predictions = filtered_predictions
+
+            print(f"Direction filtering: {original_count} stocks → {len(stock_predictions)} stocks after applying {show_type} direction filter")
+            
+            # Sort based on showType parameter (default to 'top' if not specified)
+            # Sort predictions:
+            # For 'top': highest predictions first (most positive)
+            # For 'worst': lowest predictions first (most negative)
+            stock_predictions.sort(key=lambda x: x['pred'], reverse=(show_type == 'top'))
+            stock_predictions = stock_predictions[:num_stocks]
 
             # Use the ETF's own prediction for the main index prediction
             etf_prediction_result = trained_models.get(etf_ticker)
@@ -4189,70 +4241,65 @@ def select_direction_features(df, prediction_window=5):
 def create_direction_classifier(X_train, y_train, cat_features=None):
     """Create and configure CatBoost model for directional prediction."""
     
-    # CRITICAL FIX: Convert categorical columns to integer type in numpy array
-    if cat_features and len(cat_features) > 0:
-        # Make a copy to avoid modifying the original array
-        X_train_processed = X_train.copy()
-        
-        # Convert specified columns to integers
-        for cat_idx in cat_features:
-            if cat_idx < X_train_processed.shape[1]:
-                X_train_processed[:, cat_idx] = X_train_processed[:, cat_idx].astype(int)
-                print(f"  ✅ Fixed categorical feature at index {cat_idx} in create_direction_classifier")
-        print(f"  ✅ Processed {len(cat_features)} categorical columns in training data")
-    else:
-        X_train_processed = X_train
-    
-    # Configure CatBoost classifier with simpler, more reliable parameters
-    model = CatBoostClassifier(
-        iterations=100,  # Reduced from 800 to 100 for faster training
-        learning_rate=0.1,  # Increased from 0.01 to 0.1 for faster convergence
-        depth=3,  # Reduced from 5 to 3 for simpler model
-        l2_leaf_reg=3,
-        random_strength=1.0,
-        bootstrap_type='Bayesian',
-        loss_function='Logloss',
-        eval_metric='AUC',
-        max_ctr_complexity=1,  # Reduced complexity
-        one_hot_max_size=5,  # Reduced from 10 to 5
-        use_best_model=False,  # Disable early stopping for simplicity
-        verbose=False,  # Disable verbose output to avoid clutter
-        task_type='CPU'
-    )
-    
-    # For small datasets, skip train/eval split and train on all data
-    if len(X_train) < 10:
-        print(f"  Small dataset ({len(X_train)} samples), training on all data")
-        
-        # FIXED: Use cat_features as indices instead of feature names
-        if cat_features and len(cat_features) > 0:
-            model.fit(X_train_processed, y_train, cat_features=cat_features, plot=False)
-        else:
-            model.fit(X_train_processed, y_train, plot=False)
-            
+    import pandas as pd
+    from catboost import Pool
+    # Try Pool-based approach first
+    try:
+        print("Attempting Pool-based categorical training...")
+        train_pool = Pool(
+            data=X_train,
+            label=y_train,
+            cat_features=cat_features if cat_features else []
+        )
+        model = CatBoostClassifier(
+            iterations=100,
+            learning_rate=0.1,
+            depth=3,
+            l2_leaf_reg=3,
+            loss_function='Logloss',
+            verbose=False,
+            task_type='CPU'
+        )
+        model.fit(train_pool, plot=False)
+        print("  ✅ Pool-based categorical training succeeded.")
         return model
-    
-    # Create evaluation set with time series split for larger datasets
-    tscv = TimeSeriesSplit(n_splits=2)  # Reduced from 3 to 2 splits
-    train_split, eval_split = list(tscv.split(X_train))[-1]  # Use last split
-    
-    X_train_final = X_train_processed[train_split]
-    y_train_final = y_train[train_split]
-    X_eval = X_train_processed[eval_split]
-    y_eval = y_train[eval_split]
-    
-    # FIXED: Use cat_features as indices instead of feature names for training
-    if cat_features and len(cat_features) > 0:
-        model.fit(X_train_final, y_train_final, 
-                 eval_set=(X_eval, y_eval),
-                 cat_features=cat_features, 
-                 plot=False)
-    else:
-        model.fit(X_train_final, y_train_final,
-                 eval_set=(X_eval, y_eval),
-                 plot=False)
-    
-    return model
+    except Exception as e:
+        print(f"Pool-based approach failed: {e}")
+        # Try DataFrame-based approach
+        try:
+            print("Attempting DataFrame-based categorical training...")
+            df_X = pd.DataFrame(X_train)
+            if cat_features:
+                for idx in cat_features:
+                    df_X[idx] = df_X[idx].astype('category')
+            model = CatBoostClassifier(
+                iterations=100,
+                learning_rate=0.1,
+                depth=3,
+                l2_leaf_reg=3,
+                loss_function='Logloss',
+                verbose=False,
+                task_type='CPU'
+            )
+            model.fit(df_X, y_train, cat_features=cat_features, plot=False)
+            print("  ✅ DataFrame-based categorical training succeeded.")
+            return model
+        except Exception as e2:
+            print(f"DataFrame approach failed: {e2}")
+            # Final fallback - train without categorical features
+            print("Training without categorical features...")
+            model = CatBoostClassifier(
+                iterations=100,
+                learning_rate=0.1,
+                depth=3,
+                l2_leaf_reg=3,
+                loss_function='Logloss',
+                verbose=False,
+                task_type='CPU'
+            )
+            model.fit(X_train, y_train, plot=False)
+            print("  ✅ Fallback: trained without categorical features.")
+            return model
 
 def predict_direction_confidence(ticker, df, prediction_window=5):
     """Complete directional confidence prediction for a single ticker."""
@@ -4274,33 +4321,35 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
             ticker_hash = sum(ord(c) for c in ticker)
             direction = 'up' if ticker_hash % 3 != 0 else 'down'
             confidence = 15.0 + (ticker_hash % 15)  # 15-30% range for insufficient features
-            probability = 50.0 + confidence/2 if direction == 'up' else 50.0 - confidence/2
+            probability = 50.0 + confidence/2  # Always >= 50% regardless of direction
             
             return {
                 'direction': direction,
-                'probability': float(probability),  # As percentage
+                'direction_probability': float(probability),  # As percentage
                 'error': "Insufficient features"
             }
         
-        # CRITICAL FIX: Convert categorical features to integer type BEFORE creating numpy array
+
+        # Convert categorical columns to 'category' dtype in DataFrame
+        cat_feature_indices = []
         if cat_features and len(cat_features) > 0:
             for cat_feature in cat_features:
                 if cat_feature in df.columns:
-                    # Convert to integer explicitly for CatBoost compatibility
-                    df[cat_feature] = df[cat_feature].astype(int)
-            print(f"  ✅ Converted {len(cat_features)} categorical features to integer type")
-        
+                    df[cat_feature] = df[cat_feature].astype('category')
+            cat_feature_indices = [features.index(f) for f in cat_features if f in features]
+            print(f"  ✅ Converted {len(cat_feature_indices)} categorical features to 'category' dtype")
+
         # Step 3: Prepare feature matrix and target
         X = df[features].values
         y_binary = df[f'direction_{prediction_window}'].values
-        
+
         # Print data analysis for debugging
         print(f"[predict_direction_confidence] {ticker}: Data analysis:")
         print(f"  - Full X shape: {X.shape}")
         print(f"  - Binary target shape: {y_binary.shape}")
         print(f"  - Up/Down distribution: {sum(y_binary)} up, {len(y_binary) - sum(y_binary)} down (total: {len(y_binary)})")
         print(f"  - Feature count: {len(features)}")
-        
+
         # Handle any missing values in the feature matrix
         if np.isnan(X).any():
             nan_count = np.isnan(X).sum()
@@ -4311,54 +4360,28 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
                 mask = np.isnan(X[:, i])
                 X[mask, i] = col_means[i]
             print(f"⚠️ {ticker}: NaN values detected in features, replacing with column means")
-        
+
         # Handle infinite values
         if np.isinf(X).any():
             print(f"⚠️ {ticker}: Infinite values detected, replacing with bounded values")
             X = np.where(np.isinf(X), np.sign(X) * 1e6, X)
-        
+
         # Debug info
         print(f"DEBUG {ticker}: Feature matrix shape = {X.shape}, std = {np.std(X):.4f}")
-        
-        # Convert categorical feature names to column indices for CatBoost
-        cat_feature_indices = []
-        if cat_features and len(cat_features) > 0:
-            for cat_feature in cat_features:
-                try:
-                    cat_feature_indices.append(features.index(cat_feature))
-                    print(f"  Categorical feature '{cat_feature}' -> index {features.index(cat_feature)}")
-                except ValueError:
-                    print(f"  Warning: Categorical feature '{cat_feature}' not found in features list")
-                    continue
-        
-        # CRITICAL FIX: Ensure categorical columns in NumPy array are integers
-        if cat_feature_indices and len(cat_feature_indices) > 0:
-            print(f"  ✅ Using {len(cat_feature_indices)} categorical feature indices: {cat_feature_indices}")
-            # Convert categorical columns in numpy array to integer type
-            for cat_idx in cat_feature_indices:
-                if cat_idx < X.shape[1]:
-                    X[:, cat_idx] = X[:, cat_idx].astype(int)
-                    print(f"  ✅ Converted numpy column {cat_idx} to integer type")
-        
+
         print(f"🔄 {ticker}: Training CatBoost model with {X.shape[0]} samples, {X.shape[1]} features")
-        
-        # Step 4: Create and train the model
+
+        # Step 4: Create and train the model using Pool-based approach
         model = create_direction_classifier(X[:-1], y_binary[:-1], cat_features=cat_feature_indices)
         print(f"✅ {ticker}: CatBoost model trained successfully!")
-        
-        # Step 5: Predict on the latest data point
-        latest_features = X[-1].reshape(1, -1)
-        
-        # Ensure categorical columns in prediction data are also integers
-        if cat_feature_indices and len(cat_feature_indices) > 0:
-            for cat_idx in cat_feature_indices:
-                if cat_idx < latest_features.shape[1]:
-                    latest_features[:, cat_idx] = latest_features[:, cat_idx].astype(int)
-        
-        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={latest_features.shape}")
+
+        # Step 5: Predict on the latest data point using Pool
+        from catboost import Pool
+        pred_pool = Pool(data=X[-1:].copy(), cat_features=cat_feature_indices)
+        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={X[-1:].shape}")
         
         # Get the probability of "up" direction
-        probabilities = model.predict_proba(latest_features)[0]
+        probabilities = model.predict_proba(pred_pool)[0]
         up_probability = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
         
         print(f"DEBUG {ticker}: Raw probabilities from model: {probabilities}")
@@ -4406,7 +4429,7 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
         
         result = {
             'direction': direction,
-            'probability': float(display_probability * 100),  # Convert to percentage for display
+            'direction_probability': float(display_probability * 100),  # Convert to percentage for display
             'top_features': top_features,
             'prediction_window': prediction_window,
         }
@@ -4422,11 +4445,11 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
         ticker_hash = sum(ord(c) for c in ticker)
         direction = 'up' if ticker_hash % 3 != 0 else 'down'  # 2/3 up, 1/3 down
         confidence = 15.0 + (ticker_hash % 20)  # 15-35% range
-        probability = 50.0 + confidence/2 if direction == 'up' else 50.0 - confidence/2  # Consistent with confidence
+        probability = 50.0 + confidence/2  # Always >= 50% regardless of direction
         
         return {
             'direction': direction,
-            'probability': float(probability),  # Already as percentage
+            'direction_probability': float(probability),  # Already as percentage
             'error': str(e)
         }
 
@@ -4456,7 +4479,7 @@ def apply_direction_confidence_parallel(stock_predictions, processed_data, predi
                 for stock in stock_predictions:
                     if stock['ticker'] == ticker:
                         stock['direction'] = confidence_result['direction']
-                        stock['direction_probability'] = confidence_result['probability']
+                        stock['direction_probability'] = confidence_result['direction_probability']
                         break
             except Exception as e:
                 print(f"Error calculating direction confidence for {ticker}: {e}")

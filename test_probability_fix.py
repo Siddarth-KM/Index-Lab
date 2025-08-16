@@ -30,7 +30,7 @@ def test_multiple_stocks():
         result = predict_direction_confidence(ticker, features_df, prediction_window=5)
         
         direction = result['direction']
-        probability = result['probability']
+        probability = result['direction_probability']
         
         print(f'✅ {ticker}: {direction.upper()} - {probability:.1f}%')
         
