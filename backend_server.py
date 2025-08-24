@@ -1,6 +1,3 @@
-# ============================================================================
-# IMPORTS SECTION
-# ============================================================================
 import base64
 import io
 import logging
@@ -153,7 +150,7 @@ MARKET_SENTIMENT_LOCK = Lock()
 LAST_NEWS_API_CALL = None
 
 # List of supported index names
-SUPPORTED_INDEXES = ['SPY', 'DIA', 'NASDAQ', 'SP400', 'SPLV', 'SPHB']
+SUPPORTED_INDEXES = ['SPY', 'DIA', 'NASDAQ', 'SP400', 'SPLV', 'SPHB', 'SPSM']
 
 def is_index_ticker(ticker):
     """Check if a ticker is one of our supported indexes"""
@@ -1305,7 +1302,8 @@ INDEX_URLS = {
     'NASDAQ': 'https://en.wikipedia.org/wiki/Nasdaq-100',
     'SP400': 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies',
     'SPLV': '',  # Will be hardcoded later
-    'SPHB': ''   # Will be hardcoded later
+    'SPHB': '',  # Will be hardcoded later
+    'SPSM': 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
 }
 
 INDEX_ETF_TICKERS = {
@@ -1313,6 +1311,7 @@ INDEX_ETF_TICKERS = {
     'SPY': 'SPY',
     'DOW': 'DIA',
     'SP400': 'MDY',
+    'SPSM': 'SPSM',
 }
 
 def get_cached_data(cache_key):
@@ -1991,8 +1990,10 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating volatility: {e}")
             df['volatility'] = df['rolling_20d_std'] = np.nan
-        
-        # 10. CRITICAL: Add forward return targets for training
+
+        df['close_lag_1'] = df['Close'].shift(1)
+        df['close_lag_5'] = df['Close'].shift(5)
+
         try:
             df[f'forward_return_{prediction_window}'] = flatten_series(
                 (df['Close'].shift(-prediction_window) / df['Close']) - 1
@@ -2001,10 +2002,10 @@ def add_features_to_stock_original(ticker, df, prediction_window=5):
         except Exception as e:
             print(f"[add_features_to_stock_original] {ticker}: Error calculating forward returns: {e}")
             df[f'forward_return_{prediction_window}'] = np.nan
-        
+
         print(f"[add_features_to_stock_original] {ticker}: Added {len([c for c in df.columns if c not in ['Open', 'High', 'Low', 'Close', 'Volume', 'Adj Close']])} features")
         return df
-        
+
     except Exception as e:
         print(f"[add_features_to_stock_original] ERROR for {ticker}: {e}")
         return None
@@ -4375,15 +4376,17 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
         model = create_direction_classifier(X[:-1], y_binary[:-1], cat_features=cat_feature_indices)
         print(f"✅ {ticker}: CatBoost model trained successfully!")
 
-        # Step 5: Predict on the latest data point using Pool
-        from catboost import Pool
-        pred_pool = Pool(data=X[-1:].copy(), cat_features=cat_feature_indices)
-        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={X[-1:].shape}")
-        
-        # Get the probability of "up" direction
-        probabilities = model.predict_proba(pred_pool)[0]
+        # Step 5: Predict on the latest data point using DataFrame
+        latest_features_df = df[features].iloc[[-1]].copy()
+        # Ensure categorical columns are 'category' dtype
+        for cat_feature in cat_features:
+            if cat_feature in latest_features_df.columns:
+                latest_features_df[cat_feature] = latest_features_df[cat_feature].astype('category')
+        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={latest_features_df.shape}")
+
+        probabilities = model.predict_proba(latest_features_df)[0]
         up_probability = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
-        
+
         print(f"DEBUG {ticker}: Raw probabilities from model: {probabilities}")
         print(f"DEBUG {ticker}: Raw up probability: {up_probability:.4f}")
         

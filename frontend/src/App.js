@@ -324,6 +324,9 @@ const StockPredictionApp = () => {
                             {index.label}
                           </option>
                         ))}
+                        <option key="SPSM" value="SPSM" className="bg-slate-900 text-white">
+                          S&P 600 Small Cap
+                        </option>
                       </select>
                       <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-300 pointer-events-none" size={20} />
                     </div>
