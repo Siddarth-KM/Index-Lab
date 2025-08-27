@@ -102,7 +102,7 @@ const StockPredictionApp = () => {
     { id: 7, name: 'Support Vector Regression', description: 'Balanced, stable' },
     { id: 8, name: 'Gradient Boosting Conformal', description: 'High vol, adaptive' },
     { id: 9, name: 'Elastic Net Conformal', description: 'Low vol, regularized' },
-    { id: 10, name: 'MLPRegressor Sequence Model', description: 'Sequence modeling (scikit-learn MLPRegressor)' }
+    { id: 10, name: 'MLPRegressor Sequence Model', description: 'Sequence modeling' }
   ];
   // --- Model explanations for tooltips ---
   const modelExplanations = {
