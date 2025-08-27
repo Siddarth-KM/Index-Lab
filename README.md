@@ -26,4 +26,4 @@ IndexLab combines advanced machine learning with a user-friendly web interface t
 | Support Vector Regression | SVM | Balanced, stable |
 | Gradient Boosting Conformal | Boosting | High volatility, adaptive |
 | Elastic Net Conformal | Regularized | Low volatility, regularized |
-| MLPRegressor Sequence Model | MLPRegressor | Sequence modeling using scikit-learn MLPRegressor |
+| MLPRegressor Sequence Model | MLPRegressor | Sequence modeling |
