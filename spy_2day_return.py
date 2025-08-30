@@ -1,9 +1,7 @@
 import yfinance as yf
 
-
-# Set start and end dates for a 2-day window
-end_date = '2025-08-22'
-start_date = '2025-08-18' 
+end_date = '2025-08-29'
+start_date = '2025-08-25' 
 
 spy = yf.download('SPY', start=start_date, end=end_date)
 

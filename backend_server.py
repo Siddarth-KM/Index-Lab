@@ -8,6 +8,9 @@ import re
 import time
 import traceback
 import warnings
+import threading
+import time
+from catboost import Pool
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from threading import Lock
@@ -1301,8 +1304,8 @@ INDEX_URLS = {
     'DOW': 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average',
     'NASDAQ': 'https://en.wikipedia.org/wiki/Nasdaq-100',
     'SP400': 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies',
-    'SPLV': '',  # Will be hardcoded later
-    'SPHB': '',  # Will be hardcoded later
+    'SPLV': '', 
+    'SPHB': '',  
     'SPSM': 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
 }
 
@@ -1342,6 +1345,61 @@ def save_to_cache(cache_key, data):
             print(f"Error saving to cache: {e}")
 
 def scrape_index_constituents(index_name, force_refresh=False):
+    # --- Helper functions at the top for proper scope ---
+    def scrape_yahoo_etf_holdings(etf_ticker):
+        url = f"https://finance.yahoo.com/quote/{etf_ticker}/holdings?p={etf_ticker}"
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table")
+            tickers = []
+            if table:
+                for row in table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        ticker = cells[0].get_text(strip=True)
+                        if 1 <= len(ticker) <= 6 and ticker.isupper():
+                            tickers.append(ticker)
+            return tickers
+        except Exception as e:
+            print(f"[scrape_yahoo_etf_holdings] Error: {e}")
+            return []
+
+    def scrape_wikipedia_table(url, ticker_col=0):
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", {"class": "wikitable"})
+            tickers = []
+            if table:
+                for row in table.find_all("tr")[1:]:
+                    cells = row.find_all("td")
+                    if len(cells) > ticker_col:
+                        ticker = cells[ticker_col].get_text(strip=True).replace(".", "-")
+                        if 1 <= len(ticker) <= 6 and ticker.isupper():
+                            tickers.append(ticker)
+            return tickers
+        except Exception as e:
+            print(f"[scrape_wikipedia_table] Error: {e}")
+            return []
+
+    # FIX: Define cache_key before any index-specific logic
+    cache_key = f"constituents_{index_name}"
+
+    # Wikipedia scraping for SPSM (S&P 600)
+    if index_name == 'SPSM':
+        url = INDEX_URLS['SPSM']
+        tickers = scrape_wikipedia_table(url, ticker_col=0)
+        if len(tickers) > 100:
+            save_to_cache(cache_key, tickers)
+            return tickers
+        fallback = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+        save_to_cache(cache_key, fallback)
+        return fallback
     # Hardcoded SPHB tickers (since not available on Wikipedia)
     SPHB_TICKERS = [
         "MCHP", "SMCI", "MU", "ON", "NVDA", "AMD", "MPWR", "PLTR", "AVGO", "LRCX", "WDC", "DELL", "TER", "KLAC", "AMAT", "ORCL",
@@ -1374,80 +1432,92 @@ def scrape_index_constituents(index_name, force_refresh=False):
         return SPHB_TICKERS
     if index_name == 'SPLV':
         return SPLV_TICKERS
+    # Hardcoded QQQ (NASDAQ-100) tickers
+    QQQ_TICKERS = [
+        "ADBE","AMD","ABNB","GOOGL","GOOG","AMZN","AEP","AMGN","ADI","AAPL","AMAT","APP","ARM","ASML","AZN","TEAM","ADSK","ADP","AXON",
+        "BKR","BIIB","BKNG","AVGO","CDNS","CDW","CHTR","CMCSA","CEG","COST","CPRT","CSGP","CSCO","CRWD","CSX","DDOG","DXCM","EA","EXC",
+        "FANG","FAST","FTNT","GEHC","GFS","GILD","HON","IDXX","INTC","INTU","ISRG","KDP","KHC","KLAC","LIN","LRCX","LULU","MAR","MCHP",
+        "MDLZ","MELI","META","MNST","MRVL","MSFT","MSTR","MU","NFLX","NVDA","NXPI","ODFL","ON","ORLY","PANW","PAYX","PCAR","PDD","PEP",
+        "PLTR","PYPL","QCOM","REGN","ROP","ROST","SHOP","SBUX","SNPS","TMUS","TTD","TTWO","TSLA","TXN","VRSK","VRTX","WBD","WDAY","XEL","ZS"
+    ]
+    # Yahoo scraping for SPY (S&P 500) and MDY (S&P 400)
+    def scrape_yahoo_etf_holdings(etf_ticker):
+        url = f"https://finance.yahoo.com/quote/{etf_ticker}/holdings?p={etf_ticker}"
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table")
+            tickers = []
+            if table:
+                for row in table.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        ticker = cells[0].get_text(strip=True)
+                        if 1 <= len(ticker) <= 6 and ticker.isupper():
+                            tickers.append(ticker)
+            return tickers
+        except Exception as e:
+            print(f"[scrape_yahoo_etf_holdings] Error: {e}")
+            return []
+
+    def scrape_wikipedia_table(url, ticker_col=0):
+
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table", {"class": "wikitable"})
+            tickers = []
+            if table:
+                for row in table.find_all("tr")[1:]:
+                    cells = row.find_all("td")
+                    if len(cells) > ticker_col:
+                        ticker = cells[ticker_col].get_text(strip=True).replace(".", "-")
+                        if 1 <= len(ticker) <= 6 and ticker.isupper():
+                            tickers.append(ticker)
+            return tickers
+        except Exception as e:
+            print(f"[scrape_wikipedia_table] Error: {e}")
+            return []
+
     cache_key = f"constituents_{index_name}"
     if not force_refresh:
         cached_data = get_cached_data(cache_key)
         if cached_data:
             return cached_data
-    url = INDEX_URLS.get(index_name)
-    if not url:
-        return []
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, 'html.parser')
-        blacklist = {'THE', 'AND', 'FOR', 'INC', 'LTD', 'CORP', 'CO', 'LLC', 'ETF', 'PLC', 'GROUP', 'CLASS', 'FUND', 'TRUST', 'HOLDINGS', 'COMPANY', 'CORPORATION', 'LIMITED', 'NYSE', 'NASDAQ', 'NASDA'}
-        tables = soup.find_all('table', class_='wikitable')
-        best_tickers = []
-        best_table = -1
-        best_col = -1
-        best_score = 0
-        for table_idx, table in enumerate(tables):
-            if not isinstance(table, Tag):
-                continue
-            rows = table.find_all('tr') if hasattr(table, 'find_all') else []
-            if len(rows) < 2:
-                continue
-            header_cells = rows[0].find_all(['td', 'th']) if isinstance(rows[0], Tag) else []
-            num_cols = len(header_cells)
-            for i, row in enumerate(rows[:6]):
-                if not isinstance(row, Tag):
-                    continue
-                cells = row.find_all(['td', 'th']) if hasattr(row, 'find_all') else []
-                print(f"  Row {i}: {[cell.get_text(strip=True) if isinstance(cell, Tag) else str(cell) for cell in cells]}")
-            for col_idx in range(num_cols):
-                col_tickers = []
-                for row in rows[1:]:
-                    if not isinstance(row, Tag):
-                        continue
-                    cells = row.find_all(['td', 'th']) if hasattr(row, 'find_all') else []
-                    if len(cells) > col_idx:
-                        cell = cells[col_idx]
-                        if isinstance(cell, Tag):
-                            a = cell.find('a') if hasattr(cell, 'find') else None
-                            cell_text = a.get_text(strip=True) if a and hasattr(a, 'get_text') else cell.get_text(strip=True) if hasattr(cell, 'get_text') else str(cell)
-                        else:
-                            cell_text = str(cell)
-                        candidate = re.match(r'^([A-Z]{1,5})$', cell_text.replace('.', '').replace(' ', ''))
-                        ticker = candidate.group(1) if candidate else None
-                        if ticker and ticker not in blacklist:
-                            col_tickers.append(ticker)
-                header_text = header_cells[col_idx].get_text(strip=True).lower() if isinstance(header_cells[col_idx], Tag) else str(header_cells[col_idx]).lower()
-                print(f"    Table {table_idx+1} Col {col_idx+1} header: '{header_text}' first 10 values: {col_tickers[:10]}")
-                unique_tickers = set(col_tickers)
-                score = len(unique_tickers)
-                if header_text in ['symbol', 'ticker']:
-                    score += 1000  # strong preference for 'symbol' or 'ticker' header
-                if score > best_score and len(unique_tickers) > 5:
-                    best_score = score
-                    best_tickers = list(unique_tickers)
-                    best_table = table_idx + 1
-                    best_col = col_idx + 1
-        if len(best_tickers) >= 5:
-            print(f"[scrape_index_constituents] {index_name}: Used table #{best_table}, column #{best_col}, found {len(best_tickers)} tickers: {best_tickers[:10]}... (force_refresh={force_refresh})")
-            save_to_cache(cache_key, best_tickers)
-            return best_tickers
-        print(f"[scrape_index_constituents] {index_name}: No valid table/column found, using core fallback list. (force_refresh={force_refresh})")
-        core = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-        save_to_cache(cache_key, core)
-        return core
-    except requests.RequestException as e:
-        print(f"Network error scraping {index_name}: {e}")
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-    except Exception as e:
-        print(f"Unexpected error scraping {index_name}: {e}")
-        traceback.print_exc()
-        return ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+
+
+    # Hardcoded QQQ
+    if index_name == 'NASDAQ':
+        save_to_cache(cache_key, QQQ_TICKERS)
+        return QQQ_TICKERS
+
+    # Wikipedia scraping for SPY (S&P 500)
+    if index_name == 'SPY':
+        url = INDEX_URLS['SPY']
+        tickers = scrape_wikipedia_table(url, ticker_col=0)
+        if len(tickers) > 100:
+            save_to_cache(cache_key, tickers)
+            return tickers
+        fallback = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+        save_to_cache(cache_key, fallback)
+        return fallback
+
+    # Wikipedia scraping for MDY (S&P 400)
+    if index_name == 'SP400':
+        url = INDEX_URLS['SP400']
+        tickers = scrape_wikipedia_table(url, ticker_col=0)
+        if len(tickers) > 50:
+            save_to_cache(cache_key, tickers)
+            return tickers
+        fallback = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
+        save_to_cache(cache_key, fallback)
+        return fallback
+
+    # ...existing code...
 
 def download_market_data_cache(start_date, force_refresh=False):
     """Download and cache market data for cross-asset features"""
@@ -4149,8 +4219,7 @@ if __name__ == '__main__':
     # Pre-fetch market sentiment at startup (optional, with timeout)
     try:
         # Simple timeout mechanism (works on Windows)
-        import threading
-        import time
+
         
         def fetch_with_timeout():
             global startup_sentiment_result
@@ -4242,8 +4311,8 @@ def select_direction_features(df, prediction_window=5):
 def create_direction_classifier(X_train, y_train, cat_features=None):
     """Create and configure CatBoost model for directional prediction."""
     
-    import pandas as pd
-    from catboost import Pool
+  
+
     # Try Pool-based approach first
     try:
         print("Attempting Pool-based categorical training...")
@@ -4547,7 +4616,6 @@ if __name__ == '__main__':
     print("=" * 50)
     
     # Suppress Flask startup messages
-    import logging
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
     
