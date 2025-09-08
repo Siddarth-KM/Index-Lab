@@ -31,7 +31,7 @@ const StockPredictionApp = () => {
   const iconRefs = useRef({});
   const [customTicker, setCustomTicker] = useState('');
   const isCustom = formData.index === 'CUSTOM';
-  // ...existing code...
+  
 
   // --- Effect: Close modal on ESC key ---
   useEffect(() => {

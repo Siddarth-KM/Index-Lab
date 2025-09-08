@@ -1421,10 +1421,18 @@ def scrape_index_constituents(index_name, force_refresh=False):
         "MSI", "VRSN", "ROP",
         "VZ",
     ]
+    # Hardcoded DOW 30 tickers (since they change rarely)
+    DOW_TICKERS = [
+        'AAPL', 'AMGN', 'AXP', 'BA', 'CAT', 'CRM', 'CSCO', 'CVX', 'DIS', 'DOW',
+        'GS', 'HD', 'HON', 'IBM', 'INTC', 'JNJ', 'JPM', 'KO', 'MCD', 'MMM',
+        'MRK', 'MSFT', 'NKE', 'PG', 'TRV', 'UNH', 'V', 'VZ', 'WBA', 'WMT'
+    ]
     if index_name == 'SPHB':
         return SPHB_TICKERS
     if index_name == 'SPLV':
         return SPLV_TICKERS
+    if index_name == 'DOW':
+        return DOW_TICKERS
     # Hardcoded QQQ (NASDAQ-100) tickers
     QQQ_TICKERS = [
         "ADBE","AMD","ABNB","GOOGL","GOOG","AMZN","AEP","AMGN","ADI","AAPL","AMAT","APP","ARM","ASML","AZN","TEAM","ADSK","ADP","AXON",
@@ -1507,20 +1515,6 @@ def scrape_index_constituents(index_name, force_refresh=False):
             save_to_cache(cache_key, tickers)
             return tickers
         fallback = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA']
-        save_to_cache(cache_key, fallback)
-        return fallback
-
-    # Wikipedia scraping for DOW (Dow Jones Industrial Average)
-    if index_name == 'DOW':
-        url = INDEX_URLS['DOW']
-        tickers = scrape_wikipedia_table(url, ticker_col=0)
-        if len(tickers) > 20:  # DOW has 30 companies
-            save_to_cache(cache_key, tickers)
-            return tickers
-        # DOW fallback with major blue-chip stocks
-        fallback = ['AAPL', 'MSFT', 'UNH', 'GS', 'HD', 'MCD', 'CAT', 'V', 'AXP', 'BA', 
-                   'TRV', 'JPM', 'JNJ', 'PG', 'CVX', 'MRK', 'KO', 'DIS', 'MMM', 'IBM',
-                   'WMT', 'NKE', 'CRM', 'HON', 'AMGN', 'INTC', 'CSCO', 'VZ', 'WBA', 'DOW']
         save_to_cache(cache_key, fallback)
         return fallback
 
@@ -4316,30 +4310,25 @@ def select_direction_features(df, prediction_window=5):
     return available_features, available_categorical
 
 def create_direction_classifier(X_train, y_train, cat_features=None):
-    """Create and configure CatBoost model for directional prediction."""
+    """Create and configure CatBoost model for directional prediction, handling categoricals numerically."""
     
-    train_pool = None  # Initialize for proper cleanup
-    
-    # Convert numpy array to DataFrame for better categorical handling
+    # Convert numpy array to DataFrame for better handling
     df_X = pd.DataFrame(X_train)
     
-    # Handle categorical features properly
+    # Convert categorical features to numeric encoding to avoid pandas categorical issues
     if cat_features and len(cat_features) > 0:
-        print(f"Processing {len(cat_features)} categorical features...")
+        print(f"Processing {len(cat_features)} categorical features with numeric encoding...")
         for idx in cat_features:
-            if idx < df_X.shape[1]:  # Ensure index is valid
-                # Handle NaN values in categorical features by converting to string
-                df_X[idx] = df_X[idx].fillna('missing').astype(str).astype('category')
-        print(f"  ✅ Converted {len(cat_features)} features to categorical")
+            if idx < df_X.shape[1]:
+                # Convert to string first, handle missing values, then use label encoding
+                df_X[idx] = df_X[idx].fillna(-999).astype(str)
+                # Use pandas factorize for consistent numeric encoding
+                df_X[idx] = pd.factorize(df_X[idx])[0]
+        print(f"  ✅ Converted {len(cat_features)} features to numeric encoding")
     
-    # Try Pool-based approach with DataFrame
+    # Train with numeric features only (no categorical features specified to CatBoost)
     try:
-        print("Attempting Pool-based categorical training with DataFrame...")
-        train_pool = Pool(
-            data=df_X,
-            label=y_train,
-            cat_features=cat_features if cat_features else []
-        )
+        print("Training CatBoost model with numeric-encoded features...")
         model = CatBoostClassifier(
             iterations=100,
             learning_rate=0.1,
@@ -4349,59 +4338,15 @@ def create_direction_classifier(X_train, y_train, cat_features=None):
             verbose=False,
             task_type='CPU'
         )
-        model.fit(train_pool, plot=False)
-        print("  ✅ Pool-based categorical training succeeded.")
+        model.fit(df_X, y_train, plot=False)
+        print("  ✅ Numeric-encoded training succeeded.")
         return model
     except Exception as e:
-        print(f"Pool-based approach failed: {e}")
-    finally:
-        # Clean up Pool object to prevent memory leaks
-        if train_pool is not None:
-            del train_pool
-            train_pool = None
-    
-    # Try DataFrame-based approach as backup
-    try:
-        print("Attempting DataFrame-based categorical training...")
-        model = CatBoostClassifier(
-            iterations=100,
-            learning_rate=0.1,
-            depth=3,
-            l2_leaf_reg=3,
-            loss_function='Logloss',
-            verbose=False,
-            task_type='CPU'
-        )
-        model.fit(df_X, y_train, cat_features=cat_features, plot=False)
-        print("  ✅ DataFrame-based categorical training succeeded.")
-        return model
-    except Exception as e2:
-        print(f"DataFrame approach failed: {e2}")
-        
-        # If all else fails, convert categorical features to numeric and train
-        print("Converting categorical features to numeric and training...")
-        df_X_numeric = df_X.copy()
-        if cat_features:
-            for idx in cat_features:
-                if idx < df_X_numeric.shape[1]:
-                    # Convert categorical to numeric using label encoding
-                    df_X_numeric[idx] = pd.to_numeric(df_X_numeric[idx], errors='coerce').fillna(0)
-        
-        model = CatBoostClassifier(
-            iterations=100,
-            learning_rate=0.1,
-            depth=3,
-            l2_leaf_reg=3,
-            loss_function='Logloss',
-            verbose=False,
-            task_type='CPU'
-        )
-        model.fit(df_X_numeric, y_train, plot=False)
-        print("  ✅ Numeric conversion approach succeeded.")
-        return model
+        print(f"❌ Training failed: {e}")
+        raise e
 
 def predict_direction_confidence(ticker, df, prediction_window=5):
-    """Complete directional confidence prediction for a single ticker."""
+    """Complete directional confidence prediction with robust categorical handling."""
     print(f"🔮 Predicting directional confidence for {ticker}")
     
     try:
@@ -4427,23 +4372,8 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
                 'direction_probability': float(probability),  # As percentage
                 'error': "Insufficient features"
             }
-        
 
-        # Convert categorical columns to 'category' dtype in DataFrame
-        cat_feature_indices = []
-        if cat_features and len(cat_features) > 0:
-            for cat_feature in cat_features:
-                if cat_feature in df.columns:
-                    df[cat_feature] = df[cat_feature].astype('category')
-            cat_feature_indices = []
-            for f in cat_features:
-                if f in features:
-                    try:
-                        cat_feature_indices.append(features.index(f))
-                    except ValueError:
-                        pass
-            print(f"  ✅ Converted {len(cat_feature_indices)} categorical features to 'category' dtype")
-        # Step 3: Prepare feature matrix and target
+        # Step 3: Create feature matrix and binary target
         X = df[features].values
         y_binary = df[f'direction_{prediction_window}'].values
 
@@ -4453,7 +4383,19 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
         print(f"  - Binary target shape: {y_binary.shape}")
         print(f"  - Up/Down distribution: {sum(y_binary)} up, {len(y_binary) - sum(y_binary)} down (total: {len(y_binary)})")
         print(f"  - Feature count: {len(features)}")
-        # Handle any missing values in the feature matrix
+
+        # Create indices list for categorical features
+        cat_feature_indices = []
+        if cat_features and len(cat_features) > 0:
+            for f in cat_features:
+                if f in features:
+                    try:
+                        cat_feature_indices.append(features.index(f))
+                    except ValueError:
+                        pass
+            print(f"  ✅ Identified {len(cat_feature_indices)} categorical features for numeric encoding")
+
+        # Step 4: Handle missing values in numeric data
         if np.isnan(X).any():
             nan_count = np.isnan(X).sum()
             print(f"  - {nan_count} NaN values ({(nan_count / X.size * 100):.2f}% of data)")
@@ -4469,36 +4411,46 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
             print(f"⚠️ {ticker}: Infinite values detected, replacing with bounded values")
             X = np.where(np.isinf(X), np.sign(X) * 1e6, X)
 
+        # Step 5: Convert to DataFrame for easier feature handling
+        X_df = pd.DataFrame(X, columns=features)
+        
+        # Step 6: Pre-process ALL categorical features to numeric BEFORE training
+        for idx in cat_feature_indices:
+            col_name = features[idx]
+            # Convert to string first (handles missing values better)
+            X_df[col_name] = X_df[col_name].fillna(-999).astype(str)
+            # Use simple factorize for consistent integer encoding
+            X_df[col_name] = pd.factorize(X_df[col_name])[0]
+
         # Debug info
-        print(f"DEBUG {ticker}: Feature matrix shape = {X.shape}, std = {np.std(X):.4f}")
+        print(f"DEBUG {ticker}: Feature matrix shape = {X_df.shape}, std = {np.std(X_df.values):.4f}")
+        print(f"🔄 {ticker}: Training CatBoost model with {X_df.shape[0]} samples, {X_df.shape[1]} features")
 
-        print(f"🔄 {ticker}: Training CatBoost model with {X.shape[0]} samples, {X.shape[1]} features")
-
-        # Step 4: Create and train the model using Pool-based approach
-        model = create_direction_classifier(X[:-1], y_binary[:-1], cat_features=cat_feature_indices)
+        # Step 7: Train model WITHOUT providing cat_features to CatBoost
+        # (we've already encoded them as numbers)
+        model = CatBoostClassifier(
+            iterations=100,
+            learning_rate=0.1,
+            depth=3,
+            l2_leaf_reg=3,
+            loss_function='Logloss',
+            verbose=False,
+            task_type='CPU'
+        )
+        
+        # Train on all but last row
+        model.fit(X_df.iloc[:-1], y_binary[:-1], plot=False)
         print(f"✅ {ticker}: CatBoost model trained successfully!")
 
-        # Step 5: Predict on the latest data point using DataFrame
-        latest_features_df = df[features].iloc[[-1]].copy()
+        # Step 8: Predict on the last row using CONSISTENT encoding
+        # (No need for Pool - just use the DataFrame directly)
+        latest_features = X_df.iloc[-1:].copy()
         
-        # Handle categorical columns the same way as in training
-        if cat_feature_indices and len(cat_feature_indices) > 0:
-            for idx in cat_feature_indices:
-                if idx < latest_features_df.shape[1]:
-                    col_name = latest_features_df.columns[idx]
-                    # Handle NaN values the same way as in training
-                    latest_features_df[col_name] = latest_features_df[col_name].fillna('missing').astype(str).astype('category')
-        
-        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={latest_features_df.shape}")
+        print(f"DEBUG {ticker}: Making prediction on feature vector: shape={latest_features.shape}")
 
-        pred_pool = Pool(data=latest_features_df,cat_features=cat_feature_indices)
-        
-        # Use the Pool object for prediction
-        probabilities = model.predict_proba(pred_pool)[0]
+        # Predict using the numeric DataFrame directly (no Pool needed)
+        probabilities = model.predict_proba(latest_features)[0]
         up_probability = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
-
-        # Clean up Pool object to prevent memory leaks
-        del pred_pool
 
         print(f"DEBUG {ticker}: Raw probabilities from model: {probabilities}")
         print(f"DEBUG {ticker}: Raw up probability: {up_probability:.4f}")
@@ -4531,8 +4483,6 @@ def predict_direction_confidence(ticker, df, prediction_window=5):
         
         print(f"DEBUG {ticker}: Selected direction: {direction} with probability: {display_probability:.4f}")
         
-        # For display: use the actual probability of the predicted direction
-            
         # Get feature importance if available
         top_features = {}
         try:
