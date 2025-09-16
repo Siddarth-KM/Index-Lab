@@ -1,6 +1,6 @@
 # IndexLab: AI-Driven Financial Prediction Platform
 
-IndexLab is a full-stack web application that leverages state-of-the-art machine learning models and a modern React frontend to deliver actionable financial predictions for stocks and indices. The backend, built with Flask and Python, integrates ensemble ML models, technical indicators, and sentiment analysis to provide robust forecasts with confidence intervals. The frontend offers an interactive, responsive UI powered by React and Tailwind CSS, enabling users to visualize predictions, explore market conditions, and analyze custom tickers in real time.
+IndexLab is a full-stack web application that leverages machine learning models and a modern React frontend to deliver actionable financial predictions for stocks and indices. The backend, built with Flask and Python, integrates ensemble ML models, technical indicators, and sentiment analysis to provide robust forecasts with confidence intervals. The frontend offers an interactive, responsive UI powered by React and Tailwind CSS, enabling users to visualize predictions, explore market conditions, and analyze custom tickers.
 
 ## Key Features
 - Multi-model ML backend (XGBoost, Random Forest, Neural Network, etc.)
