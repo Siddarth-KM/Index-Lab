@@ -22,7 +22,6 @@ import pandas as pd
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
-from bs4.element import Tag
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from scipy import stats
