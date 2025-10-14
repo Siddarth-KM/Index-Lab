@@ -1,6 +1,6 @@
 import yfinance as yf
-start_date = '2025-08-05' 
-end_date = '2025-09-26'
+start_date = '2025-8-05' 
+end_date = '2025-10-11'
 spy = yf.download('spy', start=start_date, end=end_date)
 open_first = spy.iloc[0]['Open']
 close_second = spy.iloc[-1]['Close']

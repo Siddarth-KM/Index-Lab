@@ -17,6 +17,6 @@ torch>=2.0.0
 catboost>=1.2.0
 scipy>=1.11.0
 
-## Frontend (React/Tailwind)
+# Frontend (React/Tailwind)
 # Node.js dependencies are managed in frontend/package.json
 # To install frontend dependencies, run `npm install` in the frontend directory.
